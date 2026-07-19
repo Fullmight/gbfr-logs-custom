@@ -131,6 +131,24 @@
   color: #cccccc;
 }
 
+.buff-section-row td {
+  padding: 6px;
+  color: #bfc5cc;
+  font-size: 12px;
+  font-style: italic;
+  border-top: 1px dashed rgb(255 255 255 / 0.2);
+}
+
+.skill-row.buff-row {
+  cursor: help;
+  color: #d5d8dc;
+}
+
+.skill-row.buff-row .damage-bar {
+  opacity: 0.32;
+  filter: saturate(0.5);
+}
+
 .table .player-row:hover {
   box-shadow:
     0 5px 3px 0 rgb(0 0 0 / 0.1),

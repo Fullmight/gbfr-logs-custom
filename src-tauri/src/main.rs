@@ -6,7 +6,10 @@ use std::{
     fs::File,
     io::Write,
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
 };
 
 use anyhow::Context;
@@ -36,6 +39,28 @@ mod parser;
 struct AlwaysOnTop(AtomicBool);
 struct ClickThrough(AtomicBool);
 struct DebugMode(AtomicBool);
+
+enum ParserCommand {
+    ResetEncounter,
+}
+
+#[derive(Default)]
+struct ParserControl(Mutex<Option<tokio::sync::mpsc::UnboundedSender<ParserCommand>>>);
+
+#[tauri::command]
+fn reset_encounter(state: State<ParserControl>) -> Result<(), String> {
+    let sender = state
+        .0
+        .lock()
+        .map_err(|_| "Parser control is unavailable".to_string())?;
+    let sender = sender
+        .as_ref()
+        .ok_or_else(|| "The game parser is not connected".to_string())?;
+
+    sender
+        .send(ParserCommand::ResetEncounter)
+        .map_err(|_| "The game parser is not connected".to_string())
+}
 
 #[tauri::command]
 fn set_debug_mode(app: AppHandle, state: State<DebugMode>, enabled: bool) {
@@ -462,6 +487,8 @@ fn connect_and_run_parser(app: AppHandle) {
 
     let database = db::connect_to_db().expect("Could not connect to database");
     let mut state = v1::Parser::new(app.clone(), window.clone(), database);
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    *app.state::<ParserControl>().0.lock().unwrap() = Some(control_tx);
 
     tauri::async_runtime::spawn(async move {
         loop {
@@ -545,6 +572,13 @@ fn connect_and_run_parser(app: AppHandle) {
                             }
                             _ = inactivity_check.tick() => {
                                 state.auto_save_if_inactive(chrono::Utc::now().timestamp_millis());
+                            }
+                            Some(command) = control_rx.recv() => {
+                                match command {
+                                    ParserCommand::ResetEncounter => {
+                                        state.reset_encounter();
+                                    }
+                                }
                             }
                         }
                     }
@@ -715,6 +749,7 @@ fn main() {
         .manage(AlwaysOnTop(AtomicBool::new(true)))
         .manage(ClickThrough(AtomicBool::new(false)))
         .manage(DebugMode(AtomicBool::new(false)))
+        .manage(ParserControl::default())
         .system_tray(system_tray_with_menu())
         .on_system_tray_event(menu_tray_handler)
         .on_window_event(|event| {
@@ -731,6 +766,7 @@ fn main() {
             toggle_always_on_top,
             export_damage_log_to_file,
             set_debug_mode,
+            reset_encounter,
         ])
         .setup(|app| {
             // Perform the game hook check in a separate thread.

@@ -1,8 +1,9 @@
 import { ActionIcon, Menu, Tooltip } from "@mantine/core";
-import { Camera, ClipboardText, Minus, PushPinSimple } from "@phosphor-icons/react";
+import { ArrowCounterClockwise, Camera, ClipboardText, Minus, PushPinSimple } from "@phosphor-icons/react";
 import { invoke } from "@tauri-apps/api";
 import { appWindow } from "@tauri-apps/api/window";
 import { Fragment, useCallback } from "react";
+import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 
 import getVersion from "@/hooks/getVersion";
@@ -81,6 +82,9 @@ export const Titlebar = ({
   const onPin = () => {
     invoke("toggle_always_on_top");
   };
+  const onResetEncounter = () => {
+    invoke("reset_encounter").catch((error) => toast.error(String(error)));
+  };
 
   const handleSimpleEncounterCopy = useCallback(() => {
     exportSimpleEncounterToClipboard(sortType, sortDirection, encounterState, partyData);
@@ -111,6 +115,11 @@ export const Titlebar = ({
             <Menu.Item onClick={handleFullEncounterCopy}>{t("ui.copy-to-clipboard-full")}</Menu.Item>
           </Menu.Dropdown>
         </Menu>
+        <Tooltip label={t("ui.reset-encounter")} color="dark">
+          <div className="titlebar-button" id="titlebar-reset-encounter" onClick={onResetEncounter}>
+            <ArrowCounterClockwise size={16} />
+          </div>
+        </Tooltip>
         <Tooltip label="Pin window" color="dark">
           <div className="titlebar-button" id="titlebar-snapshot" onClick={onPin}>
             <PushPinSimple size={16} />

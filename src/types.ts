@@ -83,6 +83,14 @@ export type SkillState = {
   damageDetails: AverageDamageDetails | null;
 };
 
+export type BuffContributionState = {
+  statusName: string;
+  kind: DamageModifierKind;
+  category: number;
+  activeHits: number;
+  contributedDamage: number;
+};
+
 export type ComputedSkillState = SkillState & {
   /** Damage contribution as a percentage of the total */
   percentage: number;
@@ -132,6 +140,8 @@ export type PlayerState = {
   lastDamageTime: number;
   /** Stats for individual skills logged */
   skillBreakdown: SkillState[];
+  /** Informational damage attribution for detected buffs; excluded from totals. */
+  buffBreakdown: BuffContributionState[];
 };
 
 export type ComputedPlayerState = PlayerState & {

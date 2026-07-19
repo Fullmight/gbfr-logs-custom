@@ -383,6 +383,7 @@ impl DerivedEncounterState {
                 stun_per_second: 0.0,
                 total_stun_value: 0.0,
                 skill_breakdown: Vec::new(),
+                buff_breakdown: Vec::new(),
                 last_known_pet_skill: None,
             });
 
@@ -719,6 +720,26 @@ impl Parser {
         }
 
         finished
+    }
+
+    /// Ends the current encounter at the user's request and prepares the meter
+    /// for a fresh encounter without discarding the current party mapping.
+    pub fn reset_encounter(&mut self) -> bool {
+        if self.status == ParserStatus::InProgress
+            && self.has_damage()
+            && !self.finish_and_save_encounter()
+        {
+            return false;
+        }
+
+        self.reset();
+        self.update_status(ParserStatus::Waiting);
+
+        if let Some(window) = &self.window_handle {
+            let _ = window.emit("encounter-update", &self.derived_state);
+        }
+
+        true
     }
 
     fn finish_and_save_encounter(&mut self) -> bool {
@@ -1100,6 +1121,41 @@ mod tests {
     }
 
     #[test]
+    fn damage_over_time_events_are_counted_in_the_encounter_and_skill_breakdown() {
+        let mut parser = Parser::default();
+        parser.on_damage_event(DamageEvent {
+            source: Actor {
+                index: 1,
+                actor_type: 0x0A58FB4D,
+                parent_actor_type: 0x0A58FB4D,
+                parent_index: 1,
+            },
+            target: Actor {
+                index: 2,
+                actor_type: 0x12345678,
+                parent_actor_type: 0x12345678,
+                parent_index: 2,
+            },
+            damage: 321,
+            flags: 0,
+            action_id: ActionType::DamageOverTime(0),
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: None,
+            details: None,
+        });
+
+        assert_eq!(parser.derived_state.total_damage, 321);
+        let player = &parser.derived_state.party[&1];
+        assert_eq!(player.total_damage, 321);
+        assert_eq!(player.skill_breakdown.len(), 1);
+        assert_eq!(
+            player.skill_breakdown[0].action_type,
+            ActionType::DamageOverTime(0)
+        );
+    }
+
+    #[test]
     fn inactive_encounter_is_saved_once() {
         let mut parser = Parser::default();
         let event = DamageEvent {
@@ -1206,6 +1262,59 @@ mod tests {
         let next_player = parser.encounter.player_data[0].as_ref().unwrap();
         assert_eq!(next_player.actor_index, 7);
         assert_eq!(next_player.display_name, "Second Player");
+    }
+
+    #[test]
+    fn manual_reset_saves_and_starts_a_fresh_encounter_without_losing_party_identity() {
+        let mut parser = Parser::default();
+        parser.on_player_identity_event(PlayerIdentityEvent {
+            character_name: CString::new("Fediel").unwrap(),
+            display_name: CString::new("Player").unwrap(),
+            character_type: 0x0A58FB4D,
+            party_index: 0,
+            actor_index: 1,
+            is_online: false,
+        });
+
+        let damage_event = |damage, action_id| DamageEvent {
+            source: Actor {
+                index: 1,
+                actor_type: 0x0A58FB4D,
+                parent_actor_type: 0x0A58FB4D,
+                parent_index: 1,
+            },
+            target: Actor {
+                index: 2,
+                actor_type: 0x12345678,
+                parent_actor_type: 0x12345678,
+                parent_index: 2,
+            },
+            damage,
+            flags: 0,
+            action_id: ActionType::Normal(action_id),
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: None,
+            details: None,
+        };
+
+        parser.on_damage_event(damage_event(100, 100));
+        assert!(parser.reset_encounter());
+        assert_eq!(parser.status, ParserStatus::Waiting);
+        assert_eq!(parser.derived_state.total_damage, 0);
+        assert!(parser.encounter.raw_event_log.is_empty());
+        assert_eq!(
+            parser.encounter.player_data[0]
+                .as_ref()
+                .unwrap()
+                .actor_index,
+            1
+        );
+
+        parser.on_damage_event(damage_event(250, 120));
+        assert_eq!(parser.status, ParserStatus::InProgress);
+        assert_eq!(parser.derived_state.total_damage, 250);
+        assert_eq!(parser.encounter.raw_event_log.len(), 1);
     }
 
     #[test]

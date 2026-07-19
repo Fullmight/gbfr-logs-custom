@@ -2,6 +2,7 @@ import { CharacterType, ComputedPlayerState, ComputedSkillGroup, ComputedSkillSt
 
 import { getSkillName } from "@/utils";
 import { useTranslation } from "react-i18next";
+import { BuffContributionRow } from "./BuffContributionRow";
 import { SkillGroupRow } from "./SkillGroupRow";
 import { SkillRow } from "./SkillRow";
 import { useSkillBreakdown } from "./useSkillBreakdown";
@@ -65,6 +66,21 @@ export const SkillBreakdown = ({ player, color }: SkillBreakdownProps) => {
           </thead>
           <tbody className="transparent-bg">
             {skills.map((skill) => renderSkillRow(player.characterType, skill, color))}
+            {player.buffBreakdown?.length > 0 && (
+              <tr className="buff-section-row">
+                <td colSpan={8}>{t("ui.buff-contribution.heading")}</td>
+              </tr>
+            )}
+            {[...(player.buffBreakdown || [])]
+              .sort((a, b) => b.contributedDamage - a.contributedDamage)
+              .map((buff) => (
+                <BuffContributionRow
+                  key={`${buff.statusName}-${buff.kind}-${buff.category}`}
+                  buff={buff}
+                  playerTotalDamage={player.totalDamage}
+                  color={color}
+                />
+              ))}
           </tbody>
         </table>
       </td>

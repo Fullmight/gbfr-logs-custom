@@ -11,7 +11,11 @@ use windows::Win32::{Foundation::HANDLE, System::Diagnostics::Debug::ReadProcess
 
 use crate::{event, process::Process};
 
-use self::{damage::OnProcessDamageHook, player::OnLoadPlayerIdentityHook, quest::OnBattleEndHook};
+use self::{
+    damage::{OnProcessDamageHook, OnProcessDotHook},
+    player::OnLoadPlayerIdentityHook,
+    quest::OnBattleEndHook,
+};
 
 mod area;
 mod damage;
@@ -28,6 +32,8 @@ type GetEntityHashID0x58 = unsafe extern "system" fn(*const usize, *const u32) -
 const ID_HUMAN_TYPE: u32 = 0x8056ABCD;
 const ID_DRAGON_TYPE: u32 = 0xF5755C0E;
 const ID_DRAGON_PARENT_ENTITY_OFFSET: usize = 0x1CA98;
+const CAGLIOSTRO_WEAPON_TYPES: [u32; 2] = [0xC9F45042, 0x2DBFD324];
+const CAGLIOSTRO_WEAPON_PARENT_OFFSET: usize = 0x578;
 
 /// Game 2.0 removed the party index from the offset used by older releases. Keep a
 /// process-local ID for every concrete actor instance instead. Two players using the
@@ -68,6 +74,11 @@ pub fn setup_hooks(tx: event::Tx) -> Result<()> {
 
     // Core DPS tracking. The main damage signature is still stable in game 2.0.2.
     OnProcessDamageHook::new(tx.clone()).setup(&process)?;
+
+    match OnProcessDotHook::new(tx.clone()).setup(&process) {
+        Ok(()) => info!("Game 2.0.2 poison and burn hooks enabled"),
+        Err(error) => warn!("Damage-over-time hooks unavailable: {error}"),
+    }
 
     // Game 2.0.2 still keeps player names in the per-actor identity snapshot, but
     // the function that refreshes it moved. This hook deliberately reads only the
@@ -154,9 +165,10 @@ pub fn get_source_parent_instance(
 
             Some((actor_type_id(parent_instance), parent_instance))
         }
-        // Wp1890: Cagliostro's Ouroboros Dragon Sled -> Pl1800
-        0xC9F45042 => {
-            let parent_instance = parent_specified_instance_at(source, 0x578)?;
+        // Wp1890/Wp1891: Cagliostro's Alexandria and Pain Train weapons -> Pl1800
+        child_type if CAGLIOSTRO_WEAPON_TYPES.contains(&child_type) => {
+            let parent_instance =
+                parent_specified_instance_at(source, CAGLIOSTRO_WEAPON_PARENT_OFFSET)?;
             Some((actor_type_id(parent_instance), parent_instance))
         }
         // Pl2000: Id's Dragon Form -> Pl1900
@@ -261,7 +273,8 @@ pub(super) fn read_process_bytes(address: *const u8, length: usize) -> Option<Ve
 #[cfg(test)]
 mod tests {
     use super::{
-        actor_idx, parent_specified_instance_at, ActorIds, ID_DRAGON_PARENT_ENTITY_OFFSET,
+        actor_idx, parent_specified_instance_at, ActorIds, CAGLIOSTRO_WEAPON_PARENT_OFFSET,
+        CAGLIOSTRO_WEAPON_TYPES, ID_DRAGON_PARENT_ENTITY_OFFSET,
     };
 
     #[test]
@@ -322,5 +335,11 @@ mod tests {
             parent_specified_instance_at(1usize as *const usize, 0),
             None
         );
+    }
+
+    #[test]
+    fn both_cagliostro_weapon_classes_use_the_verified_parent_link() {
+        assert_eq!(CAGLIOSTRO_WEAPON_TYPES, [0xC9F45042, 0x2DBFD324]);
+        assert_eq!(CAGLIOSTRO_WEAPON_PARENT_OFFSET, 0x578);
     }
 }

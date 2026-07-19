@@ -1,9 +1,23 @@
-use protocol::{ActionType, DamageEvent};
+use std::collections::HashMap;
+
+use protocol::{ActionType, DamageEvent, DamageModifierKind};
 use serde::{Deserialize, Serialize};
 
 use crate::parser::constants::{CharacterType, FerrySkillId};
 
 use super::{skill_state::SkillState, AdjustedDamageInstance};
+
+/// Damage attributed to a detected buff. This is informational and is never
+/// added to encounter, player, or skill damage totals.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BuffContributionState {
+    pub status_name: String,
+    pub kind: DamageModifierKind,
+    pub category: i32,
+    pub active_hits: u32,
+    pub contributed_damage: u64,
+}
 
 /// Derived stat breakdown for a player
 #[derive(Debug, Serialize, Deserialize)]
@@ -15,6 +29,8 @@ pub struct PlayerState {
     pub last_known_pet_skill: Option<ActionType>, // used for Ferry's skills that don't keep track of where they came from
     pub dps: f64,
     pub skill_breakdown: Vec<SkillState>,
+    #[serde(default)]
+    pub buff_breakdown: Vec<BuffContributionState>,
     pub sba: f64,
     pub total_stun_value: f64,
     pub stun_per_second: f64,
@@ -72,6 +88,7 @@ impl PlayerState {
     pub fn update_from_damage_event(&mut self, damage_instance: &AdjustedDamageInstance) {
         self.total_damage += damage_instance.event.damage as u64;
         self.total_stun_value += damage_instance.stun_damage;
+        self.update_buff_contributions(damage_instance);
 
         let parent_character_type =
             CharacterType::from_hash(damage_instance.event.source.parent_actor_type);
@@ -115,6 +132,82 @@ impl PlayerState {
         skill.update_from_damage_event(damage_instance);
         self.skill_breakdown.push(skill);
     }
+
+    fn update_buff_contributions(&mut self, damage_instance: &AdjustedDamageInstance) {
+        let Some(details) = &damage_instance.event.details else {
+            return;
+        };
+
+        let mut attack_buffs: HashMap<(String, i32), f32> = HashMap::new();
+        for status in &details.statuses {
+            if status.kind == DamageModifierKind::Attack && status.value > 0.0 {
+                *attack_buffs
+                    .entry((status.status_name.clone(), status.category))
+                    .or_default() += status.value;
+            }
+        }
+
+        let total_buff_value: f32 = attack_buffs.values().sum();
+        if total_buff_value <= 0.0 || details.formula_multiplier <= 0.0 {
+            return;
+        }
+
+        let attack_without_buffs = (details.attack_multiplier - total_buff_value).max(0.0);
+        let formula_without_buffs = (details.elemental_multiplier * details.amplify_multiplier
+            + (details.defense_multiplier * attack_without_buffs - 1.0) / 2.0)
+            * details.supplementary_multiplier;
+
+        let fallback_ratio = ((details.formula_multiplier - formula_without_buffs)
+            / details.formula_multiplier)
+            .clamp(0.0, 1.0);
+        let benefit_ratio = if details.uncapped_damage.is_finite()
+            && details.uncapped_damage > 0.0
+            && details.damage_cap > 0
+        {
+            let cap = details.damage_cap as f32;
+            let buffed_damage = details.uncapped_damage.min(cap);
+            let unbuffed_uncapped =
+                details.uncapped_damage * formula_without_buffs / details.formula_multiplier;
+            let unbuffed_damage = unbuffed_uncapped.max(0.0).min(cap);
+
+            if buffed_damage > 0.0 {
+                ((buffed_damage - unbuffed_damage) / buffed_damage).clamp(0.0, 1.0)
+            } else {
+                fallback_ratio
+            }
+        } else {
+            fallback_ratio
+        };
+
+        let total_contribution = damage_instance.event.damage.max(0) as f32 * benefit_ratio;
+        if total_contribution < 0.5 {
+            return;
+        }
+
+        for ((status_name, category), value) in attack_buffs {
+            let contributed_damage = (total_contribution * value / total_buff_value).round() as u64;
+            if contributed_damage == 0 {
+                continue;
+            }
+
+            if let Some(buff) = self.buff_breakdown.iter_mut().find(|buff| {
+                buff.status_name == status_name
+                    && buff.kind == DamageModifierKind::Attack
+                    && buff.category == category
+            }) {
+                buff.active_hits += 1;
+                buff.contributed_damage += contributed_damage;
+            } else {
+                self.buff_breakdown.push(BuffContributionState {
+                    status_name,
+                    kind: DamageModifierKind::Attack,
+                    category,
+                    active_hits: 1,
+                    contributed_damage,
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +225,7 @@ mod tests {
             last_known_pet_skill: None,
             dps: 0.0,
             skill_breakdown: vec![],
+            buff_breakdown: vec![],
             sba: 0.0,
             total_stun_value: 0.0,
             stun_per_second: 0.0,
@@ -151,6 +245,7 @@ mod tests {
             last_known_pet_skill: None,
             dps: 0.0,
             skill_breakdown: vec![],
+            buff_breakdown: vec![],
             sba: 0.0,
             total_stun_value: 0.0,
             stun_per_second: 0.0,
@@ -197,6 +292,7 @@ mod tests {
             last_known_pet_skill: None,
             dps: 0.0,
             skill_breakdown: vec![],
+            buff_breakdown: vec![],
             sba: 0.0,
             total_stun_value: 0.0,
             stun_per_second: 0.0,
@@ -251,6 +347,7 @@ mod tests {
             last_known_pet_skill: None,
             dps: 0.0,
             skill_breakdown: vec![],
+            buff_breakdown: vec![],
             sba: 0.0,
             stun_per_second: 0.0,
             total_stun_value: 0.0,
@@ -322,6 +419,7 @@ mod tests {
             last_known_pet_skill: None,
             dps: 0.0,
             skill_breakdown: vec![],
+            buff_breakdown: vec![],
             sba: 0.0,
             stun_per_second: 0.0,
             total_stun_value: 0.0,
@@ -399,6 +497,7 @@ mod tests {
             last_known_pet_skill: None,
             dps: 0.0,
             skill_breakdown: vec![],
+            buff_breakdown: vec![],
             sba: 0.0,
             total_stun_value: 0.0,
             stun_per_second: 0.0,
@@ -462,6 +561,7 @@ mod tests {
             last_known_pet_skill: None,
             dps: 0.0,
             skill_breakdown: vec![],
+            buff_breakdown: vec![],
             sba: 0.0,
             total_stun_value: 0.0,
             stun_per_second: 0.0,
@@ -495,5 +595,132 @@ mod tests {
         ));
 
         assert_eq!(player_state.total_stun_value, 5.0);
+    }
+
+    #[test]
+    fn attack_buff_damage_is_attributed_without_changing_damage_totals() {
+        let mut player_state = PlayerState {
+            index: 0,
+            character_type: CharacterType::Pl2900,
+            total_damage: 0,
+            last_known_pet_skill: None,
+            dps: 0.0,
+            skill_breakdown: vec![],
+            buff_breakdown: vec![],
+            sba: 0.0,
+            total_stun_value: 0.0,
+            stun_per_second: 0.0,
+        };
+        let damage_event = DamageEvent {
+            source: protocol::Actor {
+                index: 0,
+                actor_type: 0x0A58FB4D,
+                parent_actor_type: 0x0A58FB4D,
+                parent_index: 0,
+            },
+            target: protocol::Actor {
+                index: 1,
+                actor_type: 1,
+                parent_actor_type: 1,
+                parent_index: 1,
+            },
+            action_id: ActionType::Normal(100),
+            damage: 1_100,
+            flags: 0,
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: Some(2_000),
+            details: Some(protocol::DamageDetails {
+                elemental_multiplier: 1.0,
+                amplify_multiplier: 1.0,
+                defense_multiplier: 1.0,
+                attack_multiplier: 1.2,
+                supplementary_multiplier: 1.0,
+                formula_multiplier: 1.1,
+                attack_rate: 1.0,
+                uncapped_damage: 1_100.0,
+                damage_cap: 2_000,
+                damage_limit_multiplier: 1.0,
+                statuses: vec![protocol::DamageStatusContribution {
+                    status_name: "StatusAttackBuff".to_string(),
+                    kind: DamageModifierKind::Attack,
+                    category: 7,
+                    value: 0.2,
+                }],
+            }),
+        };
+
+        player_state.update_from_damage_event(&AdjustedDamageInstance::from_damage_event(
+            &damage_event,
+            None,
+        ));
+
+        assert_eq!(player_state.total_damage, 1_100);
+        assert_eq!(player_state.skill_breakdown[0].total_damage, 1_100);
+        assert_eq!(player_state.buff_breakdown.len(), 1);
+        assert_eq!(player_state.buff_breakdown[0].contributed_damage, 100);
+        assert_eq!(player_state.buff_breakdown[0].active_hits, 1);
+    }
+
+    #[test]
+    fn attack_buff_is_not_credited_when_the_hit_would_still_be_capped_without_it() {
+        let mut player_state = PlayerState {
+            index: 0,
+            character_type: CharacterType::Pl2900,
+            total_damage: 0,
+            last_known_pet_skill: None,
+            dps: 0.0,
+            skill_breakdown: vec![],
+            buff_breakdown: vec![],
+            sba: 0.0,
+            total_stun_value: 0.0,
+            stun_per_second: 0.0,
+        };
+        let damage_event = DamageEvent {
+            source: protocol::Actor {
+                index: 0,
+                actor_type: 0x0A58FB4D,
+                parent_actor_type: 0x0A58FB4D,
+                parent_index: 0,
+            },
+            target: protocol::Actor {
+                index: 1,
+                actor_type: 1,
+                parent_actor_type: 1,
+                parent_index: 1,
+            },
+            action_id: ActionType::Normal(100),
+            damage: 900,
+            flags: 0,
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: Some(900),
+            details: Some(protocol::DamageDetails {
+                elemental_multiplier: 1.0,
+                amplify_multiplier: 1.0,
+                defense_multiplier: 1.0,
+                attack_multiplier: 1.2,
+                supplementary_multiplier: 1.0,
+                formula_multiplier: 1.1,
+                attack_rate: 1.0,
+                uncapped_damage: 1_100.0,
+                damage_cap: 900,
+                damage_limit_multiplier: 1.0,
+                statuses: vec![protocol::DamageStatusContribution {
+                    status_name: "StatusAttackBuff".to_string(),
+                    kind: DamageModifierKind::Attack,
+                    category: 7,
+                    value: 0.2,
+                }],
+            }),
+        };
+
+        player_state.update_from_damage_event(&AdjustedDamageInstance::from_damage_event(
+            &damage_event,
+            None,
+        ));
+
+        assert_eq!(player_state.total_damage, 900);
+        assert!(player_state.buff_breakdown.is_empty());
     }
 }

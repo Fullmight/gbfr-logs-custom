@@ -15,7 +15,8 @@ type ProcessDotEventFunc = unsafe extern "system" fn(*const usize, *const usize)
 
 static_detour! {
     static ProcessDamageEvent: unsafe extern "system" fn(*const usize, *const usize, *const usize, u8) -> usize;
-    static ProcessDotEvent: unsafe extern "system" fn(*const usize, *const usize) -> usize;
+    static ProcessPoisonEvent: unsafe extern "system" fn(*const usize, *const usize) -> usize;
+    static ProcessBurnEvent: unsafe extern "system" fn(*const usize, *const usize) -> usize;
 }
 
 #[derive(Clone)]
@@ -24,7 +25,12 @@ pub struct OnProcessDamageHook {
 }
 
 const PROCESS_DAMAGE_EVENT_SIG: &str = "e8 $ { ' } 66 83 bc 24 ? ? ? ? ?";
+const PROCESS_POISON_EVENT_SIG: &str =
+    "41 57 41 56 41 55 41 54 56 57 55 53 48 83 ec 78 [1000-1600] c5 fa 2c 87 b4 00 00 00";
+const PROCESS_BURN_EVENT_SIG: &str =
+    "41 57 41 56 41 55 41 54 56 57 55 53 48 83 ec 78 [800-1400] c5 fa 2c 87 b0 00 00 00 [0-200] c7 46 04 01 00 00 00";
 const APPLIED_STUN_VALUE_OFFSET: usize = 0xB90;
+const DOT_DAMAGE_RESULT_OFFSET: usize = 0x10;
 
 #[inline(always)]
 fn read_applied_stun_value(target: *const usize) -> Option<f32> {
@@ -218,21 +224,24 @@ impl OnProcessDotHook {
     }
 
     pub fn setup(&self, process: &Process) -> Result<()> {
-        let cloned_self = self.clone();
+        let process_poison_event = process.search_match_address(PROCESS_POISON_EVENT_SIG)?;
+        let process_burn_event = process.search_match_address(PROCESS_BURN_EVENT_SIG)?;
+        let poison_hook = self.clone();
+        let burn_hook = self.clone();
 
-        if let Ok(process_dot_evt) =
-            process.search_address("44 89 74 24 ? 48 ? ? ? ? 48 ? ? e8 $ { ' } 4c")
-        {
-            #[cfg(feature = "console")]
-            println!("Found process dot event");
+        unsafe {
+            let poison_func: ProcessDotEventFunc = std::mem::transmute(process_poison_event);
+            ProcessPoisonEvent.initialize(poison_func, move |dot, result| {
+                poison_hook.run_poison(dot, result)
+            })?;
 
-            unsafe {
-                let func: ProcessDotEventFunc = std::mem::transmute(process_dot_evt);
-                ProcessDotEvent.initialize(func, move |a1, a2| cloned_self.run(a1, a2))?;
-                ProcessDotEvent.enable()?;
-            }
-        } else {
-            return Err(anyhow!("Could not find process_dot_evt"));
+            let burn_func: ProcessDotEventFunc = std::mem::transmute(process_burn_event);
+            ProcessBurnEvent.initialize(burn_func, move |dot, result| {
+                burn_hook.run_burn(dot, result)
+            })?;
+
+            ProcessPoisonEvent.enable()?;
+            ProcessBurnEvent.enable()?;
         }
 
         Ok(())
@@ -243,25 +252,46 @@ impl OnProcessDotHook {
     // A1+0x18->targetEntityInfo : CEntityInfo (Target entity of the DoT, what is being damaged)
     // A1+0x30->sourceEntityInfo : CEntityInfo (Source entity of the DoT, who applied it)
     // A1+0x50->duration : float (How much time is left for the DoT)
-    fn run(&self, dot_instance: *const usize, a2: *const usize) -> usize {
-        let original_value = unsafe { ProcessDotEvent.call(dot_instance, a2) };
+    fn run_poison(&self, dot_instance: *const usize, result: *const usize) -> usize {
+        let original_value = unsafe { ProcessPoisonEvent.call(dot_instance, result) };
+        self.emit_dot_event(dot_instance, result);
+        original_value
+    }
 
-        // @TODO(false): There's a better way to check null pointers with Option type, but I'm too dumb to figure it out right now.
-        let target_info = unsafe { dot_instance.byte_add(0x18).read() } as *const usize;
-        let source_info = unsafe { dot_instance.byte_add(0x30).read() } as *const usize;
+    fn run_burn(&self, dot_instance: *const usize, result: *const usize) -> usize {
+        let original_value = unsafe { ProcessBurnEvent.call(dot_instance, result) };
+        self.emit_dot_event(dot_instance, result);
+        original_value
+    }
 
-        if target_info.is_null() || source_info.is_null() {
-            return original_value;
-        }
-
-        let target = unsafe { target_info.byte_add(0x70).read() } as *const usize;
-        let source = unsafe { source_info.byte_add(0x70).read() } as *const usize;
+    fn emit_dot_event(&self, dot_instance: *const usize, result: *const usize) {
+        let Some(damage) = dot_damage_from_result(result) else {
+            return;
+        };
+        let Some(target_info) =
+            read_process_value::<*const usize>(dot_instance.wrapping_byte_add(0x18).cast())
+        else {
+            return;
+        };
+        let Some(source_info) =
+            read_process_value::<*const usize>(dot_instance.wrapping_byte_add(0x30).cast())
+        else {
+            return;
+        };
+        let Some(target) =
+            read_process_value::<*const usize>(target_info.wrapping_byte_add(0x70).cast())
+        else {
+            return;
+        };
+        let Some(source) =
+            read_process_value::<*const usize>(source_info.wrapping_byte_add(0x70).cast())
+        else {
+            return;
+        };
 
         if target.is_null() || source.is_null() {
-            return original_value;
+            return;
         }
-
-        let dmg = unsafe { (a2 as *const i32).read() };
 
         let source_idx = actor_idx(source);
         let source_type_id = actor_type_id(source);
@@ -287,38 +317,54 @@ impl OnProcessDotHook {
         let target_idx = actor_idx(target);
         let target_type_id = actor_type_id(target);
 
-        let event = Message::DamageEvent(DamageEvent {
-            source: Actor {
+        let event = Message::DamageEvent(dot_damage_event(
+            Actor {
                 index: source_idx,
                 actor_type: source_type_id,
                 parent_index: source_parent_idx,
                 parent_actor_type: source_parent_type_id,
             },
-            target: Actor {
+            Actor {
                 index: target_idx,
                 actor_type: target_type_id,
                 parent_index: target_idx,
                 parent_actor_type: target_type_id,
             },
-            damage: dmg,
-            flags: 0,
-            action_id: ActionType::DamageOverTime(0),
-            attack_rate: None,
-            stun_value: None,
-            damage_cap: None,
-            details: None,
-        });
+            damage,
+        ));
 
         let _ = self.tx.send(event);
+    }
+}
 
-        original_value
+#[inline(always)]
+fn dot_damage_from_result(result: *const usize) -> Option<i32> {
+    let damage =
+        read_process_value::<f32>(result.wrapping_byte_add(DOT_DAMAGE_RESULT_OFFSET).cast())?;
+    (damage.is_finite() && damage > 0.0).then_some(damage as i32)
+}
+
+fn dot_damage_event(source: Actor, target: Actor, damage: i32) -> DamageEvent {
+    DamageEvent {
+        source,
+        target,
+        damage,
+        flags: 0,
+        action_id: ActionType::DamageOverTime(0),
+        attack_rate: None,
+        stun_value: None,
+        damage_cap: None,
+        details: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{applied_stun_delta, resolve_source_parent, stun_value_for_event};
-    use protocol::ActionType;
+    use super::{
+        applied_stun_delta, dot_damage_event, dot_damage_from_result, resolve_source_parent,
+        stun_value_for_event,
+    };
+    use protocol::{ActionType, Actor};
 
     const FERRY_GHOST_TYPE: u32 = 0x2AF678E8;
     const FERRY_TYPE: u32 = 0x4C714F77;
@@ -374,5 +420,59 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn reads_game_2_dot_damage_from_the_result_payload() {
+        let mut result = [0u8; 0x18];
+        unsafe {
+            result
+                .as_mut_ptr()
+                .byte_add(0x10)
+                .cast::<f32>()
+                .write_unaligned(1_234.75);
+        }
+
+        assert_eq!(dot_damage_from_result(result.as_ptr().cast()), Some(1_234));
+    }
+
+    #[test]
+    fn ignores_non_positive_or_invalid_dot_results() {
+        for damage in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let mut result = [0u8; 0x18];
+            unsafe {
+                result
+                    .as_mut_ptr()
+                    .byte_add(0x10)
+                    .cast::<f32>()
+                    .write_unaligned(damage);
+            }
+            assert_eq!(dot_damage_from_result(result.as_ptr().cast()), None);
+        }
+    }
+
+    #[test]
+    fn dot_results_become_damage_over_time_events() {
+        let source = Actor {
+            index: 1,
+            actor_type: 2,
+            parent_index: 3,
+            parent_actor_type: 4,
+        };
+        let target = Actor {
+            index: 5,
+            actor_type: 6,
+            parent_index: 5,
+            parent_actor_type: 6,
+        };
+
+        let event = dot_damage_event(source.clone(), target.clone(), 777);
+
+        assert_eq!(event.source.index, source.index);
+        assert_eq!(event.source.parent_actor_type, source.parent_actor_type);
+        assert_eq!(event.target.index, target.index);
+        assert_eq!(event.target.actor_type, target.actor_type);
+        assert_eq!(event.damage, 777);
+        assert_eq!(event.action_id, ActionType::DamageOverTime(0));
     }
 }

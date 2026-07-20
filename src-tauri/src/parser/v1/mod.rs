@@ -512,6 +512,31 @@ pub struct Parser {
 }
 
 impl Parser {
+    fn player_actor_slots(&self) -> [Option<u32>; 4] {
+        std::array::from_fn(|index| {
+            self.encounter.player_data[index]
+                .as_ref()
+                .map(|player| player.actor_index)
+        })
+    }
+
+    fn reconcile_active_party_mapping(&mut self, previous_actor_slots: [Option<u32>; 4]) {
+        if previous_actor_slots == self.player_actor_slots()
+            || self.status != ParserStatus::InProgress
+            || !self.has_damage()
+        {
+            return;
+        }
+
+        // Damage may already use a raw actor key or a provisional stable slot.
+        // Replaying the small active event log is the only reliable way to move
+        // every form, pet, DoT, and SBA update to the new ownership mapping.
+        self.reparse();
+        if let Some(window) = &self.window_handle {
+            let _ = window.emit("encounter-update", &self.derived_state);
+        }
+    }
+
     pub fn new(app: AppHandle, window: Window, db: Connection) -> Self {
         Self {
             app: Some(app),
@@ -923,6 +948,7 @@ impl Parser {
         if party_index >= self.encounter.player_data.len() {
             return;
         }
+        let previous_actor_slots = self.player_actor_slots();
 
         // Identity events contain the verified in-game party slot. Remove a
         // provisional copy of this actor from any other slot, then keep the
@@ -936,21 +962,9 @@ impl Parser {
                 *slot = None;
             }
         }
-        let actor_index = player_data.actor_index;
         self.encounter.player_data[party_index] = Some(player_data);
 
-        // Identity can arrive after combat has already started (for example,
-        // after reconnecting mid-battle). Reparse the active event log once a
-        // raw actor row can be anchored to its verified party slot so earlier
-        // and later damage cannot remain split across two live rows.
-        if self.derived_state.party.contains_key(&actor_index) {
-            let status = self.status;
-            self.reparse();
-            self.update_status(status);
-            if let Some(window) = &self.window_handle {
-                let _ = window.emit("encounter-update", &self.derived_state);
-            }
-        }
+        self.reconcile_active_party_mapping(previous_actor_slots);
 
         self.emit_party_update();
     }
@@ -990,6 +1004,8 @@ impl Parser {
     }
 
     fn insert_player_data(&mut self, player_data: PlayerData, party_index: u8) {
+        let previous_actor_slots = self.player_actor_slots();
+
         // Insert into encounter player data array, using actor_index.
         if !player_data.is_online && party_index == 0 {
             self.encounter.player_data[0] = Some(player_data.clone());
@@ -1016,6 +1032,7 @@ impl Parser {
             }
         }
 
+        self.reconcile_active_party_mapping(previous_actor_slots);
         self.emit_party_update();
     }
 
@@ -1782,6 +1799,111 @@ mod tests {
         assert_eq!(player.total_damage, 100);
         assert_eq!(player.sba, 640.0);
         assert_eq!(parser.status, ParserStatus::InProgress);
+    }
+
+    #[test]
+    fn active_damage_follows_provisional_and_verified_slot_changes() {
+        let mut parser = Parser::default();
+        let player_data = |actor_index| PlayerData {
+            actor_index,
+            display_name: format!("Player {actor_index}"),
+            character_name: "Character".to_string(),
+            character_type: CharacterType::from_hash(0x4C71_4F77),
+            sigils: Vec::new(),
+            is_online: true,
+            weapon_info: None,
+            overmastery_info: None,
+            player_stats: None,
+        };
+
+        parser.insert_player_data(player_data(20), 1);
+        parser.on_damage_event(DamageEvent {
+            source: Actor {
+                index: 20,
+                actor_type: 0x4C71_4F77,
+                parent_actor_type: 0x4C71_4F77,
+                parent_index: 20,
+            },
+            target: Actor {
+                index: 99,
+                actor_type: 0x1234_5678,
+                parent_actor_type: 0x1234_5678,
+                parent_index: 99,
+            },
+            damage: 100,
+            flags: 0,
+            action_id: ActionType::Normal(100),
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: None,
+            details: None,
+        });
+        assert!(parser.derived_state.party.contains_key(&party_slot_key(1)));
+
+        // A lower provisional actor ID rotates actor 20 from slot 1 to slot 2.
+        parser.insert_player_data(player_data(10), 2);
+        assert!(!parser.derived_state.party.contains_key(&party_slot_key(1)));
+        assert_eq!(
+            parser.derived_state.party[&party_slot_key(2)].total_damage,
+            100
+        );
+
+        // Verified identity can then move the same actor to its real party slot.
+        parser.on_player_identity_event(PlayerIdentityEvent {
+            character_name: CString::new("Character").unwrap(),
+            display_name: CString::new("Player 20").unwrap(),
+            character_type: 0x4C71_4F77,
+            party_index: 3,
+            actor_index: 20,
+            is_online: true,
+        });
+        assert!(!parser.derived_state.party.contains_key(&party_slot_key(2)));
+        assert_eq!(
+            parser.derived_state.party[&party_slot_key(3)].total_damage,
+            100
+        );
+    }
+
+    #[test]
+    fn late_id_identity_rekeys_unlinked_dragon_damage() {
+        let mut parser = Parser::default();
+        parser.on_damage_event(DamageEvent {
+            source: Actor {
+                index: 77,
+                actor_type: 0xF575_5C0E,
+                parent_actor_type: 0xF575_5C0E,
+                parent_index: 77,
+            },
+            target: Actor {
+                index: 99,
+                actor_type: 0x1234_5678,
+                parent_actor_type: 0x1234_5678,
+                parent_index: 99,
+            },
+            damage: 100,
+            flags: 0,
+            action_id: ActionType::Normal(100),
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: None,
+            details: None,
+        });
+        assert!(parser.derived_state.party.contains_key(&77));
+
+        parser.on_player_identity_event(PlayerIdentityEvent {
+            character_name: CString::new("Id").unwrap(),
+            display_name: CString::new("Id player").unwrap(),
+            character_type: 0x8056_ABCD,
+            party_index: 2,
+            actor_index: 10,
+            is_online: true,
+        });
+
+        assert!(!parser.derived_state.party.contains_key(&77));
+        assert_eq!(
+            parser.derived_state.party[&party_slot_key(2)].total_damage,
+            100
+        );
     }
 
     #[test]

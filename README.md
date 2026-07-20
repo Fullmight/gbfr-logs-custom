@@ -9,7 +9,8 @@ This edition is based on [false-spring/gbfr-logs](https://github.com/false-sprin
 ## How to install
 
 - Go to [Releases](https://github.com/onelittlechildawa/gbfr-logs/releases/)
-- Download the latest .msi installer and run it.
+- Download either the latest `.msi` installer or the Windows portable ZIP.
+- For the portable version, extract the entire ZIP to a writable folder and run `GBFR Logs Awa Edition.exe`. Keep the executable, `hook.dll`, `assets`, and `lang` together.
 - Open GBFR Logs Awa Edition after the game is already running.
 
 ## Screenshots
@@ -81,7 +82,7 @@ See [how to add an exclusion to Windows Defender](https://support.microsoft.com/
 
 > Q: How do I update?
 
-Automatic updates are disabled in the Awa Edition so an upstream release cannot overwrite this fork. Download new installers manually from this fork's [Releases](https://github.com/onelittlechildawa/gbfr-logs/releases) page.
+Automatic updates are disabled in the Awa Edition so an upstream release cannot overwrite this fork. Download new installers or portable archives manually from this fork's [Releases](https://github.com/onelittlechildawa/gbfr-logs/releases) page. Portable users can retain `logs.db` when replacing the other extracted files to keep their encounter history.
 
 > Q: How do I uninstall?
 
@@ -102,6 +103,7 @@ Create a [new GitHub issue](https://github.com/onelittlechildawa/gbfr-logs/issue
 - Install nightly Rust ([rustup.rs](https://rustup.rs/)) + [Node.js](https://nodejs.org/en/download).
 - Install NPM dependencies with `npm install`
 - `npm run tauri dev`
+- Build a Windows portable ZIP and SHA-256 checksum with `npm run package:portable`.
 
 ## Under the hood
 

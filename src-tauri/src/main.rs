@@ -3,6 +3,7 @@
 
 use std::{
     collections::HashMap,
+    env,
     fs::File,
     io::Write,
     path::Path,
@@ -769,6 +770,18 @@ fn show_window(app: &AppHandle) {
 }
 
 fn main() {
+    // Keep runtime files beside the executable. Windows does not guarantee the
+    // working directory when an executable is launched from a shortcut, shell,
+    // or extracted archive, while the hook DLL and logs database intentionally
+    // use relative paths.
+    if let Some(executable_directory) = env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(Path::to_path_buf))
+    {
+        env::set_current_dir(executable_directory)
+            .expect("Could not use the application directory as the working directory");
+    }
+
     info!("Starting application..");
 
     // Setup the database.

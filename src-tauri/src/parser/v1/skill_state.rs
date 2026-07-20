@@ -235,19 +235,24 @@ impl SkillState {
         self.max_stun_value = self.max_stun_value.max(damage_instance.stun_damage);
         self.total_stun_value += damage_instance.stun_damage;
 
-        if let Some(details) = &damage_instance.event.details {
-            let base = details.uncapped_damage as f64;
-            let cap = details.damage_cap as f64;
-            if base.is_finite() && base > 0.0 && cap.is_finite() && cap > 0.0 {
-                self.overcap_base_sum += base;
-                self.overcap_cap_sum += cap;
+        let has_independent_damage_details =
+            !matches!(self.action_type, ActionType::SupplementaryDamage(_));
+
+        if has_independent_damage_details {
+            if let Some(details) = &damage_instance.event.details {
+                let base = details.uncapped_damage as f64;
+                let cap = details.damage_cap as f64;
+                if base.is_finite() && base > 0.0 && cap.is_finite() && cap > 0.0 {
+                    self.overcap_base_sum += base;
+                    self.overcap_cap_sum += cap;
+                }
             }
         }
 
         // Supplementary damage is emitted as a separate event, but its ratio is
         // already represented by `e` on the originating hit. Do not create a
         // second, misleading copy of the same detail record on pursuit rows.
-        if !matches!(self.action_type, ActionType::SupplementaryDamage(_)) {
+        if has_independent_damage_details {
             if let Some(details) = &damage_instance.event.details {
                 let damage = damage_instance.event.damage as u64;
                 if let Some(average) = &mut self.damage_details {
@@ -450,5 +455,17 @@ mod tests {
         ));
         assert_eq!(skill.overcap_base_sum, 670_621.0);
         assert_eq!(skill.overcap_cap_sum, 530_591.0);
+
+        let mut supplementary =
+            SkillState::new(ActionType::SupplementaryDamage(1), CharacterType::Pl0000);
+        let mut supplementary_event = event(first);
+        supplementary_event.action_id = ActionType::SupplementaryDamage(1);
+        supplementary.update_from_damage_event(&AdjustedDamageInstance::from_damage_event(
+            &supplementary_event,
+            None,
+        ));
+        assert_eq!(supplementary.overcap_base_sum, 0.0);
+        assert_eq!(supplementary.overcap_cap_sum, 0.0);
+        assert!(supplementary.damage_details.is_none());
     }
 }

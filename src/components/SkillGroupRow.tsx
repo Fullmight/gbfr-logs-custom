@@ -1,5 +1,6 @@
-import { CharacterType, ComputedSkillGroup } from "@/types";
-import { getSkillName } from "@/utils";
+import { useMeterSettingsStore } from "@/stores/useMeterSettingsStore";
+import { AbilityBreakdownColumn, CharacterType, ComputedSkillGroup } from "@/types";
+import { computeOvercapPercentage, getSkillName } from "@/utils";
 import { CaretDown, CaretUp } from "@phosphor-icons/react";
 import { SkillRow } from "./SkillRow";
 import { useSkillGroupRow } from "./useSkillGroupRow";
@@ -11,6 +12,7 @@ export type SkillRowProps = {
 };
 
 export const SkillGroupRow = ({ characterType, group, color }: SkillRowProps) => {
+  const abilityColumns = useMeterSettingsStore((state) => state.ability_breakdown_columns);
   const {
     showFullValues,
     totalDamage,
@@ -87,6 +89,14 @@ export const SkillGroupRow = ({ characterType, group, color }: SkillRowProps) =>
           {group.percentage.toFixed(0)}
           <span className="unit font-sm">%</span>
         </td>
+        {abilityColumns.map((column) => {
+          const value = column === AbilityBreakdownColumn.Overcap ? computeOvercapPercentage(group) : null;
+          return (
+            <td key={column} className="text-center row-data">
+              {value === null ? "—" : `${value.toFixed(1)}%`}
+            </td>
+          );
+        })}
         <td className="text-center row-data" />
         <div className="damage-bar" style={{ backgroundColor: color, width: `${group.percentage}%` }} />
       </tr>

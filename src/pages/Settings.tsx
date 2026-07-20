@@ -1,3 +1,4 @@
+import { AbilityBreakdownColumn } from "@/types";
 import { DragDropContext, Draggable, Droppable } from "@hello-pangea/dnd";
 import {
   ActionIcon,
@@ -44,6 +45,8 @@ const SettingsPage = () => {
     addOverlayColumn,
     removeOverlayColumn,
     open_log_on_save,
+    ability_breakdown_columns,
+    toggleAbilityBreakdownColumn,
   } = useSettings();
 
   const toggleDebugMode = () => {
@@ -194,6 +197,15 @@ const SettingsPage = () => {
               )}
             </Droppable>
           </DragDropContext>
+          <Divider />
+          <Text size="sm">{t("ui.ability-breakdown-columns.heading")}</Text>
+          <Tooltip label={t("ui.ability-breakdown-columns.overcap-description")}>
+            <Checkbox
+              label={t("ui.ability-breakdown-columns.overcap")}
+              checked={ability_breakdown_columns.includes(AbilityBreakdownColumn.Overcap)}
+              onChange={() => toggleAbilityBreakdownColumn(AbilityBreakdownColumn.Overcap)}
+            />
+          </Tooltip>
         </Stack>
       </Fieldset>
     </Box>

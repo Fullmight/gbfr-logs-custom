@@ -1,5 +1,6 @@
 import { CharacterType, ComputedPlayerState, ComputedSkillGroup, ComputedSkillState } from "@/types";
 
+import { useMeterSettingsStore } from "@/stores/useMeterSettingsStore";
 import { getSkillName } from "@/utils";
 import { useTranslation } from "react-i18next";
 import { BuffContributionRow } from "./BuffContributionRow";
@@ -47,6 +48,7 @@ const renderSkillRow = (
 export const SkillBreakdown = ({ player, color }: SkillBreakdownProps) => {
   const { t } = useTranslation();
   const { skills } = useSkillBreakdown(player);
+  const abilityColumns = useMeterSettingsStore((state) => state.ability_breakdown_columns);
 
   return (
     <tr className="skill-table">
@@ -61,6 +63,11 @@ export const SkillBreakdown = ({ player, color }: SkillBreakdownProps) => {
               <th className="header-column text-center">Max</th>
               <th className="header-column text-center">Avg</th>
               <th className="header-column text-center">%</th>
+              {abilityColumns.map((column) => (
+                <th key={column} className="header-column text-center">
+                  {t(`ui.ability-breakdown-columns.${column}`)}
+                </th>
+              ))}
               <th className="header-column text-center">{t("ui.damage-details.short")}</th>
             </tr>
           </thead>
@@ -68,7 +75,7 @@ export const SkillBreakdown = ({ player, color }: SkillBreakdownProps) => {
             {skills.map((skill) => renderSkillRow(player.characterType, skill, color))}
             {player.buffBreakdown?.length > 0 && (
               <tr className="buff-section-row">
-                <td colSpan={8}>{t("ui.buff-contribution.heading")}</td>
+                <td colSpan={8 + abilityColumns.length}>{t("ui.buff-contribution.heading")}</td>
               </tr>
             )}
             {[...(player.buffBreakdown || [])]

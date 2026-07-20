@@ -3,7 +3,7 @@ import { useShallow } from "zustand/react/shallow";
 
 import { useMeterSettingsStore } from "@/stores/useMeterSettingsStore";
 import { ComputedPlayerState, MeterColumns, PlayerData } from "@/types";
-import { humanizeNumbers } from "@/utils";
+import { computeSupPercentage, humanizeNumbers, resolvePartySlotIndex } from "@/utils";
 
 export type ColumnValue = {
   value: string | number;
@@ -27,7 +27,7 @@ export const usePlayerRow = (live: boolean, player: ComputedPlayerState, partyDa
   const [isOpen, setIsOpen] = useState(false);
 
   const playerColors = [color_1, color_2, color_3, color_4, "#9BCF53", "#380E7F", "#416D19", "#2C568D"];
-  const partySlotIndex = partyData.findIndex((partyMember) => partyMember?.actorIndex === player.index);
+  const partySlotIndex = resolvePartySlotIndex(player.index, partyData);
   const color = partySlotIndex !== -1 ? playerColors[partySlotIndex] : playerColors[player.partyIndex];
 
   const [totalDamage, totalDamageUnit] = humanizeNumbers(player.totalDamage);
@@ -55,21 +55,23 @@ export const usePlayerRow = (live: boolean, player: ComputedPlayerState, partyDa
         return showFullValues
           ? { value: (player.totalStunValue || 0).toLocaleString() }
           : { value: totalStunValue, unit: totalStunValueUnit };
+      case MeterColumns.SupPercentage:
+        return { value: computeSupPercentage(player).toFixed(1), unit: "%" };
       default:
         return { value: "" };
     }
   };
 
   // If the meter is in live mode, only show the overlay columns that are enabled, otherwise show all columns.
-  const columns = live
-    ? overlay_columns
-    : [
-        MeterColumns.TotalDamage,
-        MeterColumns.DPS,
-        MeterColumns.TotalStunValue,
-        MeterColumns.StunPerSecond,
-        MeterColumns.DamagePercentage,
-      ];
+  const savedColumns = [
+    MeterColumns.TotalDamage,
+    MeterColumns.DPS,
+    MeterColumns.TotalStunValue,
+    MeterColumns.StunPerSecond,
+    ...(overlay_columns.includes(MeterColumns.SupPercentage) ? [MeterColumns.SupPercentage] : []),
+    MeterColumns.DamagePercentage,
+  ];
+  const columns = live ? overlay_columns : savedColumns;
 
   return {
     columns,

@@ -80,6 +80,7 @@ async fn delete_all_logs() -> Result<(), String> {
     let conn = db::connect_to_db().map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM logs", [])
         .map_err(|e| e.to_string())?;
+    db::runs::delete_runs_without_rooms(&conn).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -165,6 +166,31 @@ struct SearchResult {
     player_types: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfluxSearchResult {
+    runs: Vec<db::runs::ConfluxRun>,
+    page: u32,
+    page_count: u32,
+    run_count: i32,
+}
+
+#[tauri::command]
+fn fetch_conflux_runs(page: Option<u32>) -> Result<ConfluxSearchResult, String> {
+    let conn = db::connect_to_db().map_err(|error| error.to_string())?;
+    let page = page.unwrap_or(1).max(1);
+    let per_page = 10;
+    let run_count = db::runs::get_runs_count(&conn).map_err(|error| error.to_string())?;
+    let runs = db::runs::get_runs(&conn, per_page, (page - 1) * per_page)
+        .map_err(|error| error.to_string())?;
+    Ok(ConfluxSearchResult {
+        runs,
+        page,
+        page_count: (run_count as f64 / per_page as f64).ceil() as u32,
+        run_count,
+    })
+}
+
 #[tauri::command]
 fn fetch_logs(
     page: Option<u32>,
@@ -229,7 +255,7 @@ fn fetch_logs(
     let mut player_types = Vec::new();
 
     let mut query = conn
-        .prepare("SELECT primary_target, quest_id, p1_name, p1_type, p2_name, p2_type, p3_name, p3_type, p4_name, p4_type from logs")
+        .prepare("SELECT primary_target, quest_id, p1_name, p1_type, p2_name, p2_type, p3_name, p3_type, p4_name, p4_type FROM logs WHERE run_id IS NULL")
         .map_err(|e| e.to_string())?;
 
     let rows = query
@@ -362,6 +388,9 @@ fn fetch_encounter_state(id: u64, options: ParseOptions) -> Result<EncounterStat
     for (timestamp, event) in parser.encounter.event_log() {
         match event {
             Message::DamageEvent(damage_event) => {
+                let (resolved_event, _) =
+                    v1::resolve_damage_owner(&parser.encounter.player_data, damage_event);
+                let damage_event = &resolved_event;
                 let index = ((timestamp - start_time) / DPS_INTERVAL) as usize;
                 let target_type = EnemyType::from_hash(damage_event.target.parent_actor_type);
 
@@ -431,6 +460,8 @@ fn delete_logs(ids: Vec<u64>) -> Result<(), String> {
     statement
         .execute(params_from_iter(ids))
         .map_err(|e| e.to_string())?;
+    drop(statement);
+    db::runs::delete_runs_without_rooms(&conn).map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -559,6 +590,15 @@ fn connect_and_run_parser(app: AppHandle) {
                                         protocol::Message::OnBattleEnd => {
                                             state.on_battle_end_event();
                                         }
+                                        protocol::Message::ConfluxRoomEnter(event) => {
+                                            state.on_conflux_room_enter(event);
+                                        }
+                                        protocol::Message::ConfluxBuffAcquired(event) => {
+                                            state.on_conflux_buff_acquired(event);
+                                        }
+                                        protocol::Message::ConfluxRunEnd(event) => {
+                                            state.on_conflux_run_end(event);
+                                        }
                                         }
                                     }
                                     Err(error) => {
@@ -582,6 +622,8 @@ fn connect_and_run_parser(app: AppHandle) {
                             }
                         }
                     }
+
+                    state.on_game_disconnect();
 
                     info!("Game has closed.");
 
@@ -761,6 +803,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             fetch_encounter_state,
             fetch_logs,
+            fetch_conflux_runs,
             delete_logs,
             delete_all_logs,
             toggle_always_on_top,

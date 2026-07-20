@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { getSkillTranslationKeys, toHash, toHashString } from "./utils";
+import type { PlayerState, SkillState } from "./types";
+import { computeOvercapPercentage, computeSupPercentage, getSkillTranslationKeys, toHash, toHashString } from "./utils";
 
 const englishUi = JSON.parse(readFileSync(resolve("src-tauri/lang/en/ui.json"), "utf8"));
 const skillGroups = JSON.parse(readFileSync(resolve("src-tauri/assets/skill-groups.json"), "utf8"));
@@ -76,5 +77,37 @@ describe("utils", () => {
         if (typeof name === "string") expect(name).not.toMatch(/^Skill \d+$/);
       }
     }
+  });
+
+  it("computes supplementary damage only against eligible normal/group damage", () => {
+    const skill = (actionType: SkillState["actionType"], totalDamage: number) => ({ actionType, totalDamage });
+    const player = {
+      totalDamage: 2_700,
+      skillBreakdown: [
+        skill({ Normal: 100 }, 1_000),
+        skill({ Group: "combo" }, 500),
+        skill({ SupplementaryDamage: 100 }, 300),
+        skill("SBA", 400),
+        skill("LinkAttack", 200),
+        skill({ DamageOverTime: 0 }, 300),
+      ],
+    } as PlayerState;
+
+    expect(computeSupPercentage(player)).toBeCloseTo(20);
+  });
+
+  it("returns zero for supplementary-only damage and sorts out invalid denominators", () => {
+    const player = {
+      totalDamage: 100,
+      skillBreakdown: [{ actionType: { SupplementaryDamage: 1 }, totalDamage: 100 }],
+    } as PlayerState;
+    expect(computeSupPercentage(player)).toBe(0);
+  });
+
+  it("computes exact aggregated overcap and uses a neutral null without cap data", () => {
+    expect(computeOvercapPercentage({ overcapBaseSum: 1_500, overcapCapSum: 1_000 })).toBe(150);
+    expect(computeOvercapPercentage({ overcapBaseSum: 1_000, overcapCapSum: 1_000 })).toBe(100);
+    expect(computeOvercapPercentage({ overcapBaseSum: 0, overcapCapSum: 0 })).toBeNull();
+    expect(computeOvercapPercentage({ overcapBaseSum: Number.NaN, overcapCapSum: 1_000 })).toBeNull();
   });
 });

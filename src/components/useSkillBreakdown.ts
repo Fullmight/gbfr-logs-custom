@@ -61,6 +61,8 @@ export const useSkillBreakdown = (player: ComputedPlayerState) => {
                 maxDamage: Math.max(skillGroup?.maxDamage ?? Number.MIN_VALUE, skill.maxDamage || 0),
                 skills: [...(skillGroup.skills || []), skill],
                 damageDetails: null,
+                overcapBaseSum: (skillGroup.overcapBaseSum || 0) + (skill.overcapBaseSum || 0),
+                overcapCapSum: (skillGroup.overcapCapSum || 0) + (skill.overcapCapSum || 0),
               };
             } else {
               skills.push({
@@ -75,6 +77,8 @@ export const useSkillBreakdown = (player: ComputedPlayerState) => {
                 maxStunValue: skill.maxStunValue,
                 totalStunValue: skill.totalStunValue,
                 damageDetails: null,
+                overcapBaseSum: skill.overcapBaseSum || 0,
+                overcapCapSum: skill.overcapCapSum || 0,
               });
             }
 

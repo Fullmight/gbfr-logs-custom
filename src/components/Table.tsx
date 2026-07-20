@@ -2,7 +2,7 @@ import { useTranslation } from "react-i18next";
 import { useShallow } from "zustand/react/shallow";
 import { useMeterSettingsStore } from "../stores/useMeterSettingsStore";
 import { ComputedPlayerState, EncounterState, MeterColumns, PlayerData, SortDirection, SortType } from "../types";
-import { formatInPartyOrder, sortPlayers } from "../utils";
+import { formatInPartyOrder, resolvePartySlotIndex, sortPlayers } from "../utils";
 import { PlayerRow } from "./PlayerRow";
 
 export const Table = ({
@@ -44,7 +44,7 @@ export const Table = ({
   sortPlayers(players, sortType, sortDirection);
 
   players = players.filter((player) => {
-    const partySlotIndex = partyData.findIndex((partyMember) => partyMember?.actorIndex === player.index);
+    const partySlotIndex = resolvePartySlotIndex(player.index, partyData);
 
     // If streamer mode is ON, then only show the first party slot (the streamer's character)
     // Otherwise, show all players.
@@ -61,15 +61,15 @@ export const Table = ({
   };
 
   // If the meter is in live mode, only show the overlay columns that are enabled, otherwise show all columns.
-  const columns = live
-    ? overlay_columns
-    : [
-        MeterColumns.TotalDamage,
-        MeterColumns.DPS,
-        MeterColumns.TotalStunValue,
-        MeterColumns.StunPerSecond,
-        MeterColumns.DamagePercentage,
-      ];
+  const savedColumns = [
+    MeterColumns.TotalDamage,
+    MeterColumns.DPS,
+    MeterColumns.TotalStunValue,
+    MeterColumns.StunPerSecond,
+    ...(overlay_columns.includes(MeterColumns.SupPercentage) ? [MeterColumns.SupPercentage] : []),
+    MeterColumns.DamagePercentage,
+  ];
+  const columns = live ? overlay_columns : savedColumns;
 
   return (
     <table className={`player-table table w-full ${show_full_values ? "full-values" : ""}`}>

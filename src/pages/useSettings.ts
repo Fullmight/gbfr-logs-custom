@@ -1,6 +1,6 @@
 import { SUPPORTED_LANGUAGES } from "@/i18n";
 import { useMeterSettingsStore } from "@/stores/useMeterSettingsStore";
-import { MeterColumns } from "@/types";
+import { AbilityBreakdownColumn, MeterColumns } from "@/types";
 import { DropResult } from "@hello-pangea/dnd";
 import { useTranslation } from "react-i18next";
 
@@ -25,6 +25,7 @@ export default function useSettings() {
     use_condensed_skills,
     overlay_columns,
     open_log_on_save,
+    ability_breakdown_columns,
     setMeterSettings,
   } = useMeterSettingsStore((state) => ({
     color_1: state.color_1,
@@ -39,6 +40,7 @@ export default function useSettings() {
     open_log_on_save: state.open_log_on_save,
     setMeterSettings: state.set,
     overlay_columns: state.overlay_columns,
+    ability_breakdown_columns: state.ability_breakdown_columns,
   }));
 
   const { i18n } = useTranslation();
@@ -69,6 +71,15 @@ export default function useSettings() {
     setMeterSettings({ overlay_columns: items });
   };
 
+  const toggleAbilityBreakdownColumn = (column: AbilityBreakdownColumn) => {
+    const enabled = ability_breakdown_columns.includes(column);
+    setMeterSettings({
+      ability_breakdown_columns: enabled
+        ? ability_breakdown_columns.filter((item) => item !== column)
+        : [...ability_breakdown_columns, column],
+    });
+  };
+
   const languages = Object.keys(SUPPORTED_LANGUAGES).map((key) => ({ value: key, label: SUPPORTED_LANGUAGES[key] }));
 
   const availableOverlayColumns = Object.values(MeterColumns).filter(
@@ -90,9 +101,11 @@ export default function useSettings() {
     overlay_columns,
     availableOverlayColumns,
     open_log_on_save,
+    ability_breakdown_columns,
     handleLanguageChange,
     handleReorderOverlayColumns,
     addOverlayColumn,
     removeOverlayColumn,
+    toggleAbilityBreakdownColumn,
   };
 }

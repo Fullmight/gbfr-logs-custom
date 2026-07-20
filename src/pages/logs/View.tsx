@@ -47,6 +47,8 @@ import {
   humanizeNumbers,
   millisecondsToElapsedFormat,
   openDamageCalculator,
+  resolvePartySlotIndex,
+  resolvePlayerForActor,
   toHash,
   toHashString,
   translateItemId,
@@ -269,7 +271,7 @@ export const ViewPage = () => {
 
     for (const playerIndex in dpsChart) {
       const player = players.find((p) => p.index === Number(playerIndex));
-      const partySlotIndex = playerData.findIndex((partyMember) => partyMember?.actorIndex === player?.index);
+      const partySlotIndex = player ? resolvePartySlotIndex(player.index, playerData) : -1;
       const playerName = translatedPlayerName(
         partySlotIndex,
         playerData[partySlotIndex],
@@ -301,7 +303,7 @@ export const ViewPage = () => {
 
     for (const playerIndex in sbaChart) {
       const player = players.find((p) => p.index === Number(playerIndex));
-      const partySlotIndex = playerData.findIndex((partyMember) => partyMember?.actorIndex === player?.index);
+      const partySlotIndex = player ? resolvePartySlotIndex(player.index, playerData) : -1;
       const playerName = translatedPlayerName(
         partySlotIndex,
         playerData[partySlotIndex],
@@ -317,7 +319,7 @@ export const ViewPage = () => {
   }
 
   const labels: Label = players.map((player) => {
-    const partySlotIndex = playerData.findIndex((partyMember) => partyMember?.actorIndex === player.index);
+    const partySlotIndex = resolvePartySlotIndex(player.index, playerData);
     const color = partySlotIndex !== -1 ? playerColors[partySlotIndex] : playerColors[player.partyIndex];
 
     return {
@@ -524,7 +526,7 @@ export const ViewPage = () => {
                     const eventType = Object.keys(event)[0];
 
                     // @ts-expect-error: eventType is dynamic here.
-                    const player = players.find((p) => p.index === event[eventType].actor_index);
+                    const player = resolvePlayerForActor(players, event[eventType].actor_index, playerData);
 
                     const partySlotIndex = playerData.findIndex(
                       // @ts-expect-error: eventType is dynamic here.

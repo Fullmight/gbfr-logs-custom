@@ -1,4 +1,4 @@
-import { MeterColumns } from "@/types";
+import { AbilityBreakdownColumn, MeterColumns } from "@/types";
 import { Mutate, StoreApi, create } from "zustand";
 import { persist } from "zustand/middleware";
 
@@ -14,6 +14,7 @@ interface MeterSettings {
   use_condensed_skills: boolean;
   open_log_on_save: boolean;
   overlay_columns: MeterColumns[];
+  ability_breakdown_columns: AbilityBreakdownColumn[];
 }
 
 interface MeterStateFunctions {
@@ -32,6 +33,7 @@ const DEFAULT_METER_SETTINGS: MeterSettings = {
   use_condensed_skills: true,
   open_log_on_save: true,
   overlay_columns: [MeterColumns.TotalDamage, MeterColumns.DPS, MeterColumns.DamagePercentage],
+  ability_breakdown_columns: [],
 };
 
 export type StoreWithPersist<T> = Mutate<StoreApi<T>, [["zustand/persist", T]]>;
@@ -62,6 +64,20 @@ export const useMeterSettingsStore = create<MeterSettings & MeterStateFunctions>
     }),
     {
       name: "meter-settings",
+      version: 1,
+      migrate: (persisted) => {
+        const state = persisted as Partial<MeterSettings>;
+        return {
+          ...DEFAULT_METER_SETTINGS,
+          ...state,
+          overlay_columns: Array.isArray(state.overlay_columns)
+            ? state.overlay_columns
+            : DEFAULT_METER_SETTINGS.overlay_columns,
+          ability_breakdown_columns: Array.isArray(state.ability_breakdown_columns)
+            ? state.ability_breakdown_columns
+            : [],
+        } as MeterSettings & MeterStateFunctions;
+      },
     }
   )
 );

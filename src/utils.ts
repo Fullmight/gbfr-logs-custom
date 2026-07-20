@@ -19,6 +19,47 @@ import { t } from "i18next";
 import { useEffect, useRef } from "react";
 
 export const EMPTY_ID = 2289754288;
+export const PARTY_SLOT_KEY_BASE = 0xf0000000;
+
+export const resolvePartySlotIndex = (playerIndex: number, partyData: Array<PlayerData | null>): number => {
+  if (playerIndex >= PARTY_SLOT_KEY_BASE && playerIndex < PARTY_SLOT_KEY_BASE + 4) {
+    return playerIndex - PARTY_SLOT_KEY_BASE;
+  }
+  return partyData.findIndex((partyMember) => partyMember?.actorIndex === playerIndex);
+};
+
+export const resolvePlayerForActor = <T extends PlayerState>(
+  players: T[],
+  actorIndex: number,
+  partyData: Array<PlayerData | null>
+): T | undefined => {
+  const slot = partyData.findIndex((partyMember) => partyMember?.actorIndex === actorIndex);
+  const stableKey = slot >= 0 ? PARTY_SLOT_KEY_BASE + slot : actorIndex;
+  return players.find((player) => player.index === stableKey || player.index === actorIndex);
+};
+
+export const isSupplementaryAction = (actionType: SkillState["actionType"]): boolean =>
+  typeof actionType === "object" && Object.hasOwn(actionType, "SupplementaryDamage");
+
+export const isSupplementaryEligibleAction = (actionType: SkillState["actionType"]): boolean =>
+  typeof actionType === "object" && (Object.hasOwn(actionType, "Normal") || Object.hasOwn(actionType, "Group"));
+
+/** Additional damage relative to attacks that can actually trigger it. */
+export const computeSupPercentage = (player: PlayerState): number => {
+  let supplementaryDamage = 0;
+  let eligibleDamage = 0;
+  for (const skill of player.skillBreakdown) {
+    if (isSupplementaryAction(skill.actionType)) supplementaryDamage += skill.totalDamage;
+    else if (isSupplementaryEligibleAction(skill.actionType)) eligibleDamage += skill.totalDamage;
+  }
+  return eligibleDamage > 0 ? (supplementaryDamage / eligibleDamage) * 100 : 0;
+};
+
+export const computeOvercapPercentage = (skill: { overcapBaseSum?: number; overcapCapSum?: number }): number | null => {
+  const base = skill.overcapBaseSum ?? 0;
+  const cap = skill.overcapCapSum ?? 0;
+  return Number.isFinite(base) && Number.isFinite(cap) && base > 0 && cap > 0 ? (base / cap) * 100 : null;
+};
 
 const GAME_2_CHARACTER_TYPES = new Set(["Pl2400", "Pl2500", "Pl2600", "Pl2700", "Pl2800", "Pl2900"]);
 
@@ -193,6 +234,10 @@ export const sortPlayers = (players: ComputedPlayerState[], sortType: SortType, 
       return sortDirection === "asc" ? a?.totalStunValue - b?.totalStunValue : b?.totalStunValue - a?.totalStunValue;
     } else if (sortType === MeterColumns.StunPerSecond) {
       return sortDirection === "asc" ? a?.stunPerSecond - b?.stunPerSecond : b?.stunPerSecond - a?.stunPerSecond;
+    } else if (sortType === MeterColumns.SupPercentage) {
+      const aSup = computeSupPercentage(a);
+      const bSup = computeSupPercentage(b);
+      return sortDirection === "asc" ? aSup - bSup : bSup - aSup;
     }
 
     return 0;
@@ -255,7 +300,7 @@ export const exportSimpleEncounterToClipboard = (
 
       computedSkills.sort((a, b) => b.totalDamage - a.totalDamage);
 
-      const partySlotIndex = partyData.findIndex((partyMember) => partyMember?.actorIndex === player.index);
+      const partySlotIndex = resolvePartySlotIndex(player.index, partyData);
 
       return [
         translatedPlayerName(partySlotIndex, partyData[partySlotIndex], player),
@@ -311,7 +356,7 @@ export const exportFullEncounterToClipboard = (
         };
       });
 
-      const partySlotIndex = partyData.findIndex((partyMember) => partyMember?.actorIndex === player.index);
+      const partySlotIndex = resolvePartySlotIndex(player.index, partyData);
 
       computedSkills.sort((a, b) => b.totalDamage - a.totalDamage);
 

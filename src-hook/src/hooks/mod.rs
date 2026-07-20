@@ -13,6 +13,7 @@ use crate::{event, process::Process};
 
 use self::{
     damage::{OnProcessDamageHook, OnProcessDotHook},
+    endless::{OnEndlessBuffInstallHook, OnEndlessMgrDtorHook, OnReceptionFlowDispatchHook},
     player::OnLoadPlayerIdentityHook,
     quest::OnBattleEndHook,
 };
@@ -21,6 +22,7 @@ mod area;
 mod damage;
 mod damage_details;
 mod death;
+mod endless;
 mod ffi;
 mod globals;
 mod player;
@@ -92,9 +94,32 @@ pub fn setup_hooks(tx: event::Tx) -> Result<()> {
 
     // This hooks the actual reward/result setup rather than the generic result
     // input operation, which is also reused by fall recovery and boss mechanics.
-    match OnBattleEndHook::new(tx).setup(&process) {
+    match OnBattleEndHook::new(tx.clone()).setup(&process) {
         Ok(()) => info!("Game 2.0.2 result reward hook enabled"),
         Err(error) => warn!("Battle-end hook unavailable; using inactivity fallback: {error}"),
+    }
+
+    // Conflux tracking is optional. Each signature is installed independently,
+    // so a future game patch can disable one lifecycle signal without affecting
+    // ordinary damage, identity, or battle-end logging.
+    for (name, result) in [
+        (
+            "room entry",
+            OnReceptionFlowDispatchHook::new(tx.clone()).setup(&process),
+        ),
+        (
+            "buff acquisition",
+            OnEndlessBuffInstallHook::new(tx.clone()).setup(&process),
+        ),
+        (
+            "run termination",
+            OnEndlessMgrDtorHook::new(tx).setup(&process),
+        ),
+    ] {
+        match result {
+            Ok(()) => info!("Conflux {name} hook enabled"),
+            Err(error) => warn!("Conflux {name} hook unavailable: {error}"),
+        }
     }
 
     // The 2.0 update changed the layouts and signatures used by the auxiliary hooks.

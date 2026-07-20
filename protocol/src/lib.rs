@@ -263,6 +263,24 @@ pub struct OnDeathEvent {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ConfluxRoomEnterEvent {
+    pub quest_id: u32,
+    /// Process-local identity only; never persisted as an address or dereferenced
+    /// by the desktop application.
+    pub manager_ptr: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ConfluxBuffAcquiredEvent {
+    pub buff_id: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ConfluxRunEndEvent {
+    pub manager_ptr: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
     OnAreaEnter(AreaEnterEvent),
     OnQuestComplete(QuestCompleteEvent),
@@ -278,6 +296,11 @@ pub enum Message {
     OnBattleEnd,
     /// Player name and actor mapping without version-sensitive equipment data.
     PlayerIdentityEvent(PlayerIdentityEvent),
+    /// Append-only Conflux lifecycle variants. Existing wire discriminants above
+    /// must never be reordered.
+    ConfluxRoomEnter(ConfluxRoomEnterEvent),
+    ConfluxBuffAcquired(ConfluxBuffAcquiredEvent),
+    ConfluxRunEnd(ConfluxRunEndEvent),
 }
 
 /// Damage event layout used through Awa Edition 1.8.4.

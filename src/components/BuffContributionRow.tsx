@@ -1,3 +1,4 @@
+import { useMeterSettingsStore } from "@/stores/useMeterSettingsStore";
 import { BuffContributionState } from "@/types";
 import { humanizeNumbers } from "@/utils";
 import { useTranslation } from "react-i18next";
@@ -18,6 +19,7 @@ export const BuffContributionRow = ({
   color: string;
 }) => {
   const { t } = useTranslation();
+  const abilityColumns = useMeterSettingsStore((state) => state.ability_breakdown_columns);
   const [damage, damageUnit] = humanizeNumbers(buff.contributedDamage);
   const percentage = playerTotalDamage > 0 ? (buff.contributedDamage / playerTotalDamage) * 100 : 0;
   const attributionTooltip = t("ui.buff-contribution.tooltip", {
@@ -40,6 +42,11 @@ export const BuffContributionRow = ({
         {percentage.toFixed(1)}
         <span className="unit font-sm">%</span>
       </td>
+      {abilityColumns.map((column) => (
+        <td key={column} className="text-center row-data">
+          —
+        </td>
+      ))}
       <td className="text-center row-data">{t("ui.buff-contribution.included")}</td>
       <div className="damage-bar" style={{ backgroundColor: color, width: `${Math.min(percentage, 100)}%` }} />
     </tr>

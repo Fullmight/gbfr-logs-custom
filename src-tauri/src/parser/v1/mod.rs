@@ -3,7 +3,8 @@ use std::{collections::HashMap, io::BufReader};
 use anyhow::Result;
 use chrono::Utc;
 use protocol::{
-    AreaEnterEvent, DamageEvent, Message, OnAttemptSBAEvent, OnContinueSBAChainEvent, OnDeathEvent,
+    AreaEnterEvent, ConfluxBuffAcquiredEvent, ConfluxRoomEnterEvent, ConfluxRunEndEvent,
+    DamageEvent, Message, OnAttemptSBAEvent, OnContinueSBAChainEvent, OnDeathEvent,
     OnPerformSBAEvent, OnUpdateSBAEvent, PlayerIdentityEvent, PlayerLoadEvent, QuestCompleteEvent,
 };
 use rusqlite::{params, Connection};
@@ -18,7 +19,70 @@ use super::{
 mod player_state;
 mod skill_state;
 
+use crate::db::runs::{finalize_run, insert_run, ConfluxBuffDelta};
 use player_state::PlayerState;
+
+/// Derived player rows use a namespace that cannot collide with raw game actor
+/// indices. The low two bits are the verified party slot (0..=3).
+const PARTY_SLOT_KEY_BASE: u32 = 0xF000_0000;
+
+fn party_slot_key(slot: usize) -> u32 {
+    PARTY_SLOT_KEY_BASE | slot as u32
+}
+
+fn player_key_for_actor(player_data: &[Option<PlayerData>; 4], actor_index: u32) -> u32 {
+    player_data
+        .iter()
+        .position(|player| {
+            player
+                .as_ref()
+                .is_some_and(|player| player.actor_index == actor_index)
+        })
+        .map(party_slot_key)
+        .unwrap_or(actor_index)
+}
+
+/// Resolve a damage source to its verified party owner while retaining raw
+/// indices for enemies and unresolved entities. Parent indices cover pets,
+/// avatars, DoTs, and most transformed actors; the direct source index is a
+/// conservative fallback for events whose parent link is self/empty.
+pub(crate) fn resolve_damage_owner<'a>(
+    player_data: &'a [Option<PlayerData>; 4],
+    event: &DamageEvent,
+) -> (DamageEvent, Option<&'a PlayerData>) {
+    let direct_slot = player_data.iter().position(|candidate| {
+        candidate.as_ref().is_some_and(|player| {
+            player.actor_index == event.source.parent_index
+                || player.actor_index == event.source.index
+        })
+    });
+
+    // Game 2.0.2 no longer exposes Id's old dragon-form parent link. Only use
+    // the character fallback when there is exactly one verified Id owner.
+    let dragon_slot = (CharacterType::from_hash(event.source.parent_actor_type)
+        == CharacterType::Pl2000)
+        .then(|| {
+            let mut matches = player_data.iter().enumerate().filter(|(_, candidate)| {
+                candidate
+                    .as_ref()
+                    .is_some_and(|player| player.character_type == CharacterType::Pl1900)
+            });
+            let first = matches.next().map(|(slot, _)| slot);
+            (matches.next().is_none()).then_some(first).flatten()
+        })
+        .flatten();
+
+    let Some(slot) = direct_slot.or(dragon_slot) else {
+        return (event.clone(), None);
+    };
+    let owner = player_data[slot].as_ref();
+    let mut resolved = event.clone();
+    resolved.source.parent_index = party_slot_key(slot);
+    if dragon_slot == Some(slot) {
+        resolved.source.parent_actor_type = 0x8056_ABCD; // Pl1900
+    }
+    (resolved, owner)
+}
 
 pub struct AdjustedDamageInstance<'a> {
     pub event: &'a DamageEvent,
@@ -186,7 +250,7 @@ struct Sigil {
 #[serde(rename_all = "camelCase")]
 pub struct PlayerData {
     /// Actor index for this player
-    actor_index: u32,
+    pub actor_index: u32,
     /// Display name for this player, empty if its an NPC
     display_name: String,
     /// Character name for this player if it's an NPC, otherwise it is the same as display_name
@@ -431,6 +495,20 @@ pub struct Parser {
     /// The database connection for the parser, used to save the encounter
     #[serde(skip)]
     db: Option<Connection>,
+    #[serde(skip)]
+    active_run_id: Option<i64>,
+    #[serde(skip)]
+    active_run_manager: u64,
+    #[serde(skip)]
+    active_room_index: u32,
+    #[serde(skip)]
+    active_run_buffs: Vec<ConfluxBuffDelta>,
+    #[serde(skip)]
+    active_run_start: i64,
+    #[serde(skip)]
+    active_room_start: i64,
+    #[serde(skip)]
+    active_run_completed: bool,
 }
 
 impl Parser {
@@ -482,18 +560,41 @@ impl Parser {
 
             match event {
                 Message::DamageEvent(event) => {
-                    let player_data = self
-                        .encounter
-                        .player_data
-                        .iter()
-                        .flatten()
-                        .find(|player| player.actor_index == event.source.parent_index);
-
+                    let (event, player_data) =
+                        resolve_damage_owner(&self.encounter.player_data, event);
                     let damage_instance =
-                        AdjustedDamageInstance::from_damage_event(event, player_data);
+                        AdjustedDamageInstance::from_damage_event(&event, player_data);
 
                     self.derived_state
                         .process_damage_event(*timestamp, &damage_instance);
+                }
+                Message::OnUpdateSBA(event) => {
+                    let player_key =
+                        player_key_for_actor(&self.encounter.player_data, event.actor_index);
+                    if let Some(player) = self.derived_state.party.get_mut(&player_key) {
+                        player.set_sba(event.sba_value as f64);
+                    }
+                }
+                Message::OnAttemptSBA(event) => {
+                    let player_key =
+                        player_key_for_actor(&self.encounter.player_data, event.actor_index);
+                    if let Some(player) = self.derived_state.party.get_mut(&player_key) {
+                        player.set_sba(800.0);
+                    }
+                }
+                Message::OnPerformSBA(event) => {
+                    let player_key =
+                        player_key_for_actor(&self.encounter.player_data, event.actor_index);
+                    if let Some(player) = self.derived_state.party.get_mut(&player_key) {
+                        player.set_sba(0.0);
+                    }
+                }
+                Message::OnContinueSBAChain(event) => {
+                    let player_key =
+                        player_key_for_actor(&self.encounter.player_data, event.actor_index);
+                    if let Some(player) = self.derived_state.party.get_mut(&player_key) {
+                        player.set_sba(0.0);
+                    }
                 }
                 _ => {}
             }
@@ -515,15 +616,10 @@ impl Parser {
                     let target_type = EnemyType::from_hash(event.target.parent_actor_type);
 
                     if targets.is_empty() || targets.contains(&target_type) {
-                        let player_data = self
-                            .encounter
-                            .player_data
-                            .iter()
-                            .flatten()
-                            .find(|player| player.actor_index == event.source.parent_index);
-
+                        let (event, player_data) =
+                            resolve_damage_owner(&self.encounter.player_data, event);
                         let damage_instance =
-                            AdjustedDamageInstance::from_damage_event(event, player_data);
+                            AdjustedDamageInstance::from_damage_event(&event, player_data);
 
                         self.derived_state
                             .process_damage_event(*timestamp, &damage_instance);
@@ -578,7 +674,8 @@ impl Parser {
                 }
                 _ => None,
             } {
-                if let Some(entries) = chart_values.get_mut(&actor_index) {
+                let player_key = player_key_for_actor(&self.encounter.player_data, actor_index);
+                if let Some(entries) = chart_values.get_mut(&player_key) {
                     entries[index] = sba_value;
                 }
             }
@@ -594,9 +691,12 @@ impl Parser {
     /// If there was damage in that stopped instance, then save it as a new log.
     /// Otherwise, we're waiting for the encounter to start.
     pub fn on_area_enter_event(&mut self, event: AreaEnterEvent) {
-        self.encounter.quest_id = Some(event.last_known_quest_id);
-
-        if self.status == ParserStatus::InProgress {
+        if self.active_run_id.is_some() {
+            if let Err(error) = self.finalize_active_run(false) {
+                self.report_conflux_save_error("finalize the run on area change", &error);
+                return;
+            }
+        } else if self.status == ParserStatus::InProgress {
             self.update_status(ParserStatus::Stopped);
 
             if self.has_damage() {
@@ -617,6 +717,9 @@ impl Parser {
             self.update_status(ParserStatus::Waiting);
         }
 
+        self.encounter.quest_id =
+            (event.last_known_quest_id != 0).then_some(event.last_known_quest_id);
+        self.encounter.quest_timer = None;
         self.encounter.quest_completed = false;
         self.encounter.reset_player_data();
 
@@ -626,6 +729,10 @@ impl Parser {
     }
 
     pub fn on_quest_complete_event(&mut self, event: QuestCompleteEvent) {
+        if self.active_run_id.is_some() {
+            self.active_run_completed = true;
+            return;
+        }
         self.encounter.quest_id = Some(event.quest_id);
         self.encounter.quest_timer = Some(event.elapsed_time_in_secs);
         self.encounter.quest_completed = true;
@@ -672,13 +779,7 @@ impl Parser {
         self.encounter
             .push_event(now, Message::DamageEvent(event.clone()));
 
-        let player_data = self
-            .encounter
-            .player_data
-            .iter()
-            .flatten()
-            .find(|player| player.actor_index == event.source.parent_index);
-
+        let (event, player_data) = resolve_damage_owner(&self.encounter.player_data, &event);
         let damage_instance = AdjustedDamageInstance::from_damage_event(&event, player_data);
 
         self.derived_state
@@ -694,7 +795,8 @@ impl Parser {
     /// The status changes before the database write, so future timer ticks cannot save
     /// the same battle more than once.
     pub fn auto_save_if_inactive(&mut self, now: i64) -> bool {
-        if self.status != ParserStatus::InProgress
+        if self.active_run_id.is_some()
+            || self.status != ParserStatus::InProgress
             || !self.has_damage()
             || now - self.derived_state.end_time < AUTO_SAVE_INACTIVITY_MS
         {
@@ -706,6 +808,10 @@ impl Parser {
 
     /// Handles the game 2.0 result-screen signal without depending on quest memory.
     pub fn on_battle_end_event(&mut self) -> bool {
+        if self.active_run_id.is_some() {
+            self.active_run_completed = true;
+            return false;
+        }
         if self.status != ParserStatus::InProgress || !self.has_damage() {
             return false;
         }
@@ -830,7 +936,21 @@ impl Parser {
                 *slot = None;
             }
         }
+        let actor_index = player_data.actor_index;
         self.encounter.player_data[party_index] = Some(player_data);
+
+        // Identity can arrive after combat has already started (for example,
+        // after reconnecting mid-battle). Reparse the active event log once a
+        // raw actor row can be anchored to its verified party slot so earlier
+        // and later damage cannot remain split across two live rows.
+        if self.derived_state.party.contains_key(&actor_index) {
+            let status = self.status;
+            self.reparse();
+            self.update_status(status);
+            if let Some(window) = &self.window_handle {
+                let _ = window.emit("encounter-update", &self.derived_state);
+            }
+        }
 
         self.emit_party_update();
     }
@@ -912,7 +1032,7 @@ impl Parser {
             Message::OnUpdateSBA(event.clone()),
         );
 
-        let player_index = event.actor_index;
+        let player_index = player_key_for_actor(&self.encounter.player_data, event.actor_index);
         if let Some(player) = self.derived_state.party.get_mut(&player_index) {
             player.set_sba(event.sba_value as f64);
         }
@@ -928,7 +1048,7 @@ impl Parser {
             Message::OnAttemptSBA(event.clone()),
         );
 
-        let player_index = event.actor_index;
+        let player_index = player_key_for_actor(&self.encounter.player_data, event.actor_index);
         if let Some(player) = self.derived_state.party.get_mut(&player_index) {
             player.set_sba(800.0);
         }
@@ -944,7 +1064,7 @@ impl Parser {
             Message::OnPerformSBA(event.clone()),
         );
 
-        let player_index = event.actor_index;
+        let player_index = player_key_for_actor(&self.encounter.player_data, event.actor_index);
         if let Some(player) = self.derived_state.party.get_mut(&player_index) {
             player.set_sba(0.0);
         }
@@ -961,7 +1081,7 @@ impl Parser {
             Message::OnContinueSBAChain(event.clone()),
         );
 
-        let player_index = event.actor_index;
+        let player_index = player_key_for_actor(&self.encounter.player_data, event.actor_index);
         if let Some(player) = self.derived_state.party.get_mut(&player_index) {
             player.set_sba(0.0);
         }
@@ -1015,9 +1135,213 @@ impl Parser {
         false
     }
 
+    pub fn on_game_disconnect(&mut self) {
+        if self.active_run_id.is_some() {
+            if let Err(error) = self.finalize_active_run(false) {
+                self.report_conflux_save_error("finalize the run on disconnect", &error);
+            }
+        } else if self.status == ParserStatus::InProgress && self.has_damage() {
+            let _ = self.finish_and_save_encounter();
+        }
+    }
+
+    fn start_conflux_run(&mut self, manager_ptr: u64, now: i64) -> Result<()> {
+        let conn = self
+            .db
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Database is unavailable"))?;
+        let run_id = insert_run(conn, now)?;
+
+        self.active_run_manager = manager_ptr;
+        self.active_room_index = 0;
+        self.active_run_buffs.clear();
+        self.active_run_start = now;
+        self.active_room_start = now;
+        self.active_run_completed = false;
+        self.active_run_id = Some(run_id);
+        Ok(())
+    }
+
+    pub fn on_conflux_room_enter(&mut self, event: ConfluxRoomEnterEvent) {
+        let now = Utc::now().timestamp_millis();
+        let new_run = self.active_run_id.is_none() || self.active_run_manager != event.manager_ptr;
+
+        if new_run {
+            // Preserve a normal encounter that was still active immediately
+            // before the first Endless Mode room signal.
+            if self.active_run_id.is_none()
+                && self.status == ParserStatus::InProgress
+                && self.has_damage()
+            {
+                if !self.finish_and_save_encounter() {
+                    return;
+                }
+            }
+            if self.active_run_id.is_some() {
+                if let Err(error) = self.finalize_active_run(false) {
+                    self.report_conflux_save_error("finalize the previous run", &error);
+                    return;
+                }
+            }
+            if let Err(error) = self.start_conflux_run(event.manager_ptr, now) {
+                self.report_conflux_save_error("start a run", &error);
+                return;
+            }
+        } else {
+            if let Err(error) = self.save_room_to_db_at(now) {
+                self.report_conflux_save_error("save the previous room", &error);
+                return;
+            }
+            if self.status == ParserStatus::InProgress {
+                self.update_status(ParserStatus::Stopped);
+            }
+            // Every room transition consumes an index, including rooms with no
+            // damage, so buff acquisition never shifts into a later room.
+            self.active_room_index += 1;
+        }
+
+        self.reset();
+        self.update_status(ParserStatus::Waiting);
+        self.encounter.quest_id = (event.quest_id != 0).then_some(event.quest_id);
+        self.encounter.quest_timer = None;
+        self.encounter.quest_completed = false;
+        self.encounter.reset_player_data();
+        self.active_room_start = now;
+    }
+
+    pub fn on_conflux_buff_acquired(&mut self, event: ConfluxBuffAcquiredEvent) {
+        if self.active_run_id.is_none()
+            || event.buff_id == 0
+            || self
+                .active_run_buffs
+                .iter()
+                .any(|delta| delta.buff_ids.contains(&event.buff_id))
+        {
+            return;
+        }
+
+        if let Some(delta) = self
+            .active_run_buffs
+            .iter_mut()
+            .find(|delta| delta.room_index == self.active_room_index)
+        {
+            delta.buff_ids.push(event.buff_id);
+        } else {
+            self.active_run_buffs.push(ConfluxBuffDelta {
+                room_index: self.active_room_index,
+                buff_ids: vec![event.buff_id],
+            });
+        }
+    }
+
+    pub fn on_conflux_run_end(&mut self, event: ConfluxRunEndEvent) {
+        if self.active_run_id.is_some() && event.manager_ptr == self.active_run_manager {
+            if let Err(error) = self.finalize_active_run(true) {
+                self.report_conflux_save_error("finalize the run", &error);
+            }
+        }
+    }
+
+    fn finalize_active_run(&mut self, completed: bool) -> Result<()> {
+        let Some(run_id) = self.active_run_id else {
+            return Ok(());
+        };
+
+        let now = Utc::now().timestamp_millis();
+        let existing_rooms = self
+            .db
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Database is unavailable"))?
+            .query_row(
+                "SELECT COUNT(*) FROM logs WHERE run_id = ?",
+                [run_id],
+                |row| row.get::<_, u32>(0),
+            )?;
+
+        // A lone room-enter followed immediately by teardown is a hook/setup
+        // ghost. Once a run has damage, buffs, or another room transition,
+        // preserve the final room even if it dealt zero damage.
+        let should_save_current_room =
+            self.has_damage() || existing_rooms > 0 || !self.active_run_buffs.is_empty();
+        if should_save_current_room {
+            self.save_room_to_db_at(now)?;
+            if self.status == ParserStatus::InProgress {
+                self.update_status(ParserStatus::Stopped);
+            }
+        }
+
+        let conn = self
+            .db
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Database is unavailable"))?;
+        let room_count = conn.query_row(
+            "SELECT COUNT(*) FROM logs WHERE run_id = ?",
+            [run_id],
+            |row| row.get::<_, u32>(0),
+        )?;
+        if room_count == 0 {
+            conn.execute("DELETE FROM runs WHERE id = ?", [run_id])?;
+        } else {
+            finalize_run(
+                conn,
+                run_id,
+                now,
+                room_count,
+                completed || self.active_run_completed,
+                &self.active_run_buffs,
+            )?;
+        }
+
+        self.active_run_id = None;
+        self.active_run_manager = 0;
+        self.active_room_index = 0;
+        self.active_run_buffs.clear();
+        self.active_run_start = 0;
+        self.active_room_start = 0;
+        self.active_run_completed = false;
+
+        if let Some(app) = &self.app {
+            let _ = app.emit_all("conflux-run-saved", run_id);
+        }
+        Ok(())
+    }
+
+    fn report_conflux_save_error(&self, action: &str, error: &anyhow::Error) {
+        log::error!("Could not {action}: {error}");
+        if let Some(app) = &self.app {
+            let _ = app.emit_all(
+                "encounter-saved-error",
+                format!("Could not {action}: {error}"),
+            );
+        }
+    }
+
+    fn save_room_to_db_at(&mut self, end_time: i64) -> Result<Option<i64>> {
+        self.save_encounter_to_db_inner(
+            self.active_run_id,
+            Some(self.active_room_index),
+            Some((self.active_room_start, end_time)),
+        )
+    }
+
     fn save_encounter_to_db(&mut self) -> Result<Option<i64>> {
-        let duration_in_millis = self.derived_state.duration();
-        let start_datetime = self.derived_state.utc_start_time()?;
+        self.save_encounter_to_db_inner(None, None, None)
+    }
+
+    fn save_encounter_to_db_inner(
+        &mut self,
+        run_id: Option<i64>,
+        room_index: Option<u32>,
+        timing: Option<(i64, i64)>,
+    ) -> Result<Option<i64>> {
+        let (start_time, duration_in_millis) = if let Some((start_time, end_time)) = timing {
+            (start_time, (end_time - start_time).max(1))
+        } else {
+            (
+                self.derived_state.utc_start_time()?.timestamp_millis(),
+                self.derived_state.duration(),
+            )
+        };
 
         let primary_target = self
             .derived_state
@@ -1039,7 +1363,7 @@ impl Parser {
 
         if let Some(conn) = &mut self.db {
             conn.execute(
-                r#"INSERT INTO logs (
+                r#"INSERT OR REPLACE INTO logs (
                         name,
                         time,
                         duration,
@@ -1056,11 +1380,14 @@ impl Parser {
                         p4_type,
                         quest_id,
                         quest_elapsed_time,
-                        quest_completed
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                        quest_completed,
+                        run_id,
+                        room_index,
+                        total_damage
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
                 params![
                     "",
-                    start_datetime.timestamp_millis(),
+                    start_time,
                     duration_in_millis,
                     &encounter_data,
                     1,
@@ -1075,7 +1402,10 @@ impl Parser {
                     p4.map(|p| p.character_type.to_string()),
                     self.encounter.quest_id,
                     self.encounter.quest_timer,
-                    self.encounter.quest_completed
+                    self.encounter.quest_completed,
+                    run_id,
+                    room_index,
+                    self.derived_state.total_damage as i64
                 ],
             )?;
 
@@ -1349,6 +1679,141 @@ mod tests {
     }
 
     #[test]
+    fn verified_party_slots_own_player_forms_pets_and_sba() {
+        let mut parser = Parser::default();
+        for (actor_index, party_index, name) in [(20, 1, "A"), (10, 2, "B")] {
+            parser.on_player_identity_event(PlayerIdentityEvent {
+                character_name: CString::new(name).unwrap(),
+                display_name: CString::new(name).unwrap(),
+                character_type: 0x48ADDA36,
+                party_index,
+                actor_index,
+                is_online: true,
+            });
+        }
+
+        let damage = |source_index, parent_index| DamageEvent {
+            source: Actor {
+                index: source_index,
+                actor_type: 0xDEAD_BEEF,
+                parent_actor_type: 0x48ADDA36,
+                parent_index,
+            },
+            target: Actor {
+                index: 99,
+                actor_type: 0x1234_5678,
+                parent_actor_type: 0x1234_5678,
+                parent_index: 99,
+            },
+            damage: 100,
+            flags: 0,
+            action_id: ActionType::Normal(100),
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: None,
+            details: None,
+        };
+
+        // A pet/avatar owned through parent_index and a direct player hit use
+        // stable slot keys even though the events arrive out of actor order.
+        parser.on_damage_event(damage(200, 20));
+        parser.on_damage_event(damage(10, 10));
+        assert_eq!(parser.derived_state.party.len(), 2);
+        assert_eq!(
+            parser.derived_state.party[&party_slot_key(1)].total_damage,
+            100
+        );
+        assert_eq!(
+            parser.derived_state.party[&party_slot_key(2)].total_damage,
+            100
+        );
+
+        parser.on_sba_update(OnUpdateSBAEvent {
+            actor_index: 20,
+            sba_value: 640.0,
+            sba_added: 10.0,
+        });
+        assert_eq!(parser.derived_state.party[&party_slot_key(1)].sba, 640.0);
+        assert_eq!(parser.derived_state.party[&party_slot_key(2)].sba, 0.0);
+    }
+
+    #[test]
+    fn late_identity_rekeys_existing_live_damage_and_sba() {
+        let mut parser = Parser::default();
+        parser.on_damage_event(DamageEvent {
+            source: Actor {
+                index: 20,
+                actor_type: 0x4C71_4F77,
+                parent_actor_type: 0x4C71_4F77,
+                parent_index: 20,
+            },
+            target: Actor {
+                index: 99,
+                actor_type: 0x1234_5678,
+                parent_actor_type: 0x1234_5678,
+                parent_index: 99,
+            },
+            damage: 100,
+            flags: 0,
+            action_id: ActionType::Normal(100),
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: None,
+            details: None,
+        });
+        parser.on_sba_update(OnUpdateSBAEvent {
+            actor_index: 20,
+            sba_value: 640.0,
+            sba_added: 10.0,
+        });
+        assert!(parser.derived_state.party.contains_key(&20));
+
+        parser.on_player_identity_event(PlayerIdentityEvent {
+            character_name: CString::new("Late player").unwrap(),
+            display_name: CString::new("Late player").unwrap(),
+            character_type: 0x4C71_4F77,
+            party_index: 1,
+            actor_index: 20,
+            is_online: true,
+        });
+
+        assert!(!parser.derived_state.party.contains_key(&20));
+        let player = &parser.derived_state.party[&party_slot_key(1)];
+        assert_eq!(player.total_damage, 100);
+        assert_eq!(player.sba, 640.0);
+        assert_eq!(parser.status, ParserStatus::InProgress);
+    }
+
+    #[test]
+    fn unresolved_damage_keeps_its_raw_actor_index() {
+        let mut parser = Parser::default();
+        parser.on_damage_event(DamageEvent {
+            source: Actor {
+                index: 77,
+                actor_type: 0x4C71_4F77,
+                parent_actor_type: 0x4C71_4F77,
+                parent_index: 77,
+            },
+            target: Actor {
+                index: 99,
+                actor_type: 0x1234_5678,
+                parent_actor_type: 0x1234_5678,
+                parent_index: 99,
+            },
+            damage: 100,
+            flags: 0,
+            action_id: ActionType::DamageOverTime(0),
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: None,
+            details: None,
+        });
+
+        assert!(parser.derived_state.party.contains_key(&77));
+        assert!(!parser.derived_state.party.contains_key(&party_slot_key(0)));
+    }
+
+    #[test]
     fn id_human_and_dragon_forms_share_one_player_row() {
         let mut parser = Parser::default();
         let human_actor = 10;
@@ -1390,6 +1855,49 @@ mod tests {
             player.skill_breakdown[1].child_character_type,
             CharacterType::Pl2000
         );
+    }
+
+    #[test]
+    fn shared_owner_resolver_maps_unlinked_dragon_damage_to_the_unique_id_slot() {
+        let mut parser = Parser::default();
+        parser.on_player_identity_event(PlayerIdentityEvent {
+            character_name: CString::new("Id").unwrap(),
+            display_name: CString::new("Id player").unwrap(),
+            character_type: 0x8056_ABCD,
+            party_index: 2,
+            actor_index: 10,
+            is_online: true,
+        });
+        let dragon_event = DamageEvent {
+            source: Actor {
+                index: 77,
+                actor_type: 0xF575_5C0E,
+                parent_actor_type: 0xF575_5C0E,
+                parent_index: 77,
+            },
+            target: Actor {
+                index: 99,
+                actor_type: 0x1234_5678,
+                parent_actor_type: 0x1234_5678,
+                parent_index: 99,
+            },
+            damage: 100,
+            flags: 0,
+            action_id: ActionType::Normal(100),
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: None,
+            details: None,
+        };
+
+        let (resolved, owner) = resolve_damage_owner(&parser.encounter.player_data, &dragon_event);
+
+        assert_eq!(resolved.source.parent_index, party_slot_key(2));
+        assert_eq!(
+            CharacterType::from_hash(resolved.source.parent_actor_type),
+            CharacterType::Pl1900
+        );
+        assert_eq!(owner.unwrap().actor_index, 10);
     }
 
     #[test]
@@ -1580,5 +2088,280 @@ mod tests {
         assert_eq!(parser.derived_state.start_time, 1_000);
         assert_eq!(parser.derived_state.end_time, 5_000);
         assert_eq!(parser.derived_state.duration(), 4_000);
+    }
+
+    fn conflux_test_parser() -> Parser {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE logs (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL, time INTEGER NOT NULL,
+                duration INTEGER NOT NULL, data BLOB NOT NULL, version INTEGER NOT NULL,
+                primary_target INTEGER, p1_name TEXT, p1_type TEXT, p2_name TEXT,
+                p2_type TEXT, p3_name TEXT, p3_type TEXT, p4_name TEXT, p4_type TEXT,
+                quest_id INTEGER, quest_elapsed_time INTEGER, quest_completed BOOLEAN,
+                run_id INTEGER, room_index INTEGER, total_damage INTEGER
+             );
+             CREATE UNIQUE INDEX logs_run_room_unique
+                ON logs(run_id, room_index) WHERE run_id IS NOT NULL;
+             CREATE TABLE runs (
+                id INTEGER PRIMARY KEY, start_time INTEGER NOT NULL, end_time INTEGER,
+                duration INTEGER, room_count INTEGER NOT NULL DEFAULT 0,
+                completed BOOLEAN, buffs TEXT NOT NULL DEFAULT '[]'
+             );",
+        )
+        .unwrap();
+        Parser {
+            db: Some(db),
+            ..Default::default()
+        }
+    }
+
+    fn conflux_damage(amount: i32) -> DamageEvent {
+        DamageEvent {
+            source: Actor {
+                index: 7,
+                actor_type: 0x4C71_4F77,
+                parent_actor_type: 0x4C71_4F77,
+                parent_index: 7,
+            },
+            target: Actor {
+                index: 8,
+                actor_type: 0x1234_5678,
+                parent_actor_type: 0x1234_5678,
+                parent_index: 8,
+            },
+            damage: amount,
+            flags: 0,
+            action_id: ActionType::Normal(100),
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: None,
+            details: None,
+        }
+    }
+
+    #[test]
+    fn conflux_run_saves_rooms_and_deduplicates_buffs_across_the_run() {
+        let mut parser = conflux_test_parser();
+        let room = |quest_id| ConfluxRoomEnterEvent {
+            quest_id,
+            manager_ptr: 0xAA,
+        };
+
+        parser.on_conflux_room_enter(room(10));
+        parser.on_damage_event(conflux_damage(100));
+        parser.on_conflux_buff_acquired(ConfluxBuffAcquiredEvent { buff_id: 5 });
+        parser.on_conflux_buff_acquired(ConfluxBuffAcquiredEvent { buff_id: 5 });
+        parser.on_conflux_room_enter(room(11));
+        parser.on_damage_event(conflux_damage(250));
+        parser.on_conflux_buff_acquired(ConfluxBuffAcquiredEvent { buff_id: 5 });
+        parser.on_conflux_buff_acquired(ConfluxBuffAcquiredEvent { buff_id: 6 });
+        parser.on_conflux_run_end(ConfluxRunEndEvent { manager_ptr: 0xAA });
+
+        let db = parser.db.as_ref().unwrap();
+        let (rooms, completed, buffs): (u32, bool, String) = db
+            .query_row("SELECT room_count, completed, buffs FROM runs", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(rooms, 2);
+        assert!(completed);
+        assert_eq!(
+            serde_json::from_str::<Vec<ConfluxBuffDelta>>(&buffs).unwrap(),
+            vec![
+                ConfluxBuffDelta {
+                    room_index: 0,
+                    buff_ids: vec![5]
+                },
+                ConfluxBuffDelta {
+                    room_index: 1,
+                    buff_ids: vec![6]
+                }
+            ]
+        );
+        let damage: i64 = db
+            .query_row("SELECT SUM(total_damage) FROM logs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(damage, 350);
+    }
+
+    #[test]
+    fn conflux_preserves_zero_damage_rooms_and_their_buffs() {
+        let mut parser = conflux_test_parser();
+        let room = |quest_id| ConfluxRoomEnterEvent {
+            quest_id,
+            manager_ptr: 0xAA,
+        };
+
+        parser.on_conflux_room_enter(room(10));
+        parser.on_damage_event(conflux_damage(100));
+        parser.on_conflux_room_enter(room(11));
+        parser.on_conflux_buff_acquired(ConfluxBuffAcquiredEvent { buff_id: 7 });
+        parser.on_conflux_room_enter(room(12));
+        parser.on_damage_event(conflux_damage(50));
+        parser.on_conflux_run_end(ConfluxRunEndEvent { manager_ptr: 0xAA });
+
+        let db = parser.db.as_ref().unwrap();
+        let room_count: u32 = db
+            .query_row("SELECT room_count FROM runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(room_count, 3);
+
+        let rooms = db
+            .prepare("SELECT room_index, total_damage FROM logs ORDER BY room_index")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rooms, vec![(0, 100), (1, 0), (2, 50)]);
+
+        let buffs: String = db
+            .query_row("SELECT buffs FROM runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<ConfluxBuffDelta>>(&buffs).unwrap(),
+            vec![ConfluxBuffDelta {
+                room_index: 1,
+                buff_ids: vec![7]
+            }]
+        );
+    }
+
+    #[test]
+    fn conflux_keeps_active_state_when_room_persistence_fails() {
+        let mut parser = conflux_test_parser();
+        parser.on_conflux_room_enter(ConfluxRoomEnterEvent {
+            quest_id: 10,
+            manager_ptr: 0xAA,
+        });
+        parser.on_damage_event(conflux_damage(100));
+        parser
+            .db
+            .as_ref()
+            .unwrap()
+            .execute("DROP TABLE logs", [])
+            .unwrap();
+
+        parser.on_conflux_run_end(ConfluxRunEndEvent { manager_ptr: 0xAA });
+
+        assert!(parser.active_run_id.is_some());
+        assert_eq!(parser.active_run_manager, 0xAA);
+        assert_eq!(parser.derived_state.total_damage, 100);
+        assert_eq!(parser.status, ParserStatus::InProgress);
+    }
+
+    #[test]
+    fn conflux_finalization_retry_does_not_duplicate_the_last_room() {
+        let mut parser = conflux_test_parser();
+        parser.on_conflux_room_enter(ConfluxRoomEnterEvent {
+            quest_id: 10,
+            manager_ptr: 0xAA,
+        });
+        parser.on_damage_event(conflux_damage(100));
+        parser
+            .db
+            .as_ref()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_run_update BEFORE UPDATE ON runs
+                 BEGIN SELECT RAISE(FAIL, 'forced finalization failure'); END;",
+            )
+            .unwrap();
+
+        parser.on_conflux_run_end(ConfluxRunEndEvent { manager_ptr: 0xAA });
+        assert!(parser.active_run_id.is_some());
+        let db = parser.db.as_ref().unwrap();
+        let first_count: u32 = db
+            .query_row("SELECT COUNT(*) FROM logs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(first_count, 1);
+        db.execute("DROP TRIGGER fail_run_update", []).unwrap();
+
+        parser.on_conflux_run_end(ConfluxRunEndEvent { manager_ptr: 0xAA });
+        assert!(parser.active_run_id.is_none());
+        let final_count: u32 = parser
+            .db
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM logs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(final_count, 1);
+    }
+
+    #[test]
+    fn conflux_ignores_stale_end_signals_and_removes_zero_room_runs() {
+        let mut parser = conflux_test_parser();
+        parser.on_conflux_room_enter(ConfluxRoomEnterEvent {
+            quest_id: 10,
+            manager_ptr: 0xAA,
+        });
+        parser.on_conflux_run_end(ConfluxRunEndEvent { manager_ptr: 0xBB });
+        assert!(parser.active_run_id.is_some());
+        parser.on_conflux_run_end(ConfluxRunEndEvent { manager_ptr: 0xAA });
+        assert!(parser.active_run_id.is_none());
+        let count: i64 = parser
+            .db
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn conflux_preserves_prior_normal_combat_and_finalizes_on_manager_change() {
+        let mut parser = conflux_test_parser();
+        parser.on_damage_event(conflux_damage(40));
+        parser.on_conflux_room_enter(ConfluxRoomEnterEvent {
+            quest_id: 10,
+            manager_ptr: 0xAA,
+        });
+        parser.on_damage_event(conflux_damage(100));
+        parser.on_conflux_room_enter(ConfluxRoomEnterEvent {
+            quest_id: 20,
+            manager_ptr: 0xBB,
+        });
+
+        let db = parser.db.as_ref().unwrap();
+        let ordinary: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM logs WHERE run_id IS NULL AND total_damage = 40",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let abandoned: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE completed = 0 AND room_count = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ordinary, 1);
+        assert_eq!(abandoned, 1);
+        assert_eq!(parser.active_run_manager, 0xBB);
+    }
+
+    #[test]
+    fn conflux_disconnect_saves_the_last_room_as_abandoned() {
+        let mut parser = conflux_test_parser();
+        parser.on_conflux_room_enter(ConfluxRoomEnterEvent {
+            quest_id: 10,
+            manager_ptr: 0xAA,
+        });
+        parser.on_damage_event(conflux_damage(123));
+        parser.on_game_disconnect();
+
+        let db = parser.db.as_ref().unwrap();
+        let (completed, damage): (bool, i64) = db
+            .query_row(
+                "SELECT runs.completed, logs.total_damage FROM runs JOIN logs ON logs.run_id = runs.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!completed);
+        assert_eq!(damage, 123);
     }
 }

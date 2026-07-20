@@ -81,6 +81,9 @@ export type SkillState = {
   maxStunValue: number;
   /** Damage modifiers averaged across captured hits for this skill */
   damageDetails: AverageDamageDetails | null;
+  /** Exact sums for game-style overcap: base sum / cap sum * 100. */
+  overcapBaseSum: number;
+  overcapCapSum: number;
 };
 
 export type BuffContributionState = {
@@ -119,6 +122,8 @@ export type ComputedSkillGroup = {
   maxStunValue: number;
   /** Groups do not expose a combined damage-detail average. */
   damageDetails: null;
+  overcapBaseSum: number;
+  overcapCapSum: number;
 };
 
 export type PlayerState = {
@@ -262,6 +267,11 @@ export enum MeterColumns {
   SBA = "sba",
   TotalStunValue = "total-stun-value",
   StunPerSecond = "stun-per-second",
+  SupPercentage = "sup-percentage",
+}
+
+export enum AbilityBreakdownColumn {
+  Overcap = "overcap",
 }
 
 export type SortType = MeterColumns;
@@ -287,6 +297,38 @@ export type Log = {
   questId: number | null;
   questElapsedTime: number | null;
   questCompleted: boolean;
+};
+
+export type ConfluxBuffDelta = {
+  roomIndex: number;
+  buffIds: number[];
+};
+
+export type ConfluxRoom = {
+  logId: number;
+  roomIndex: number;
+  questId: number | null;
+  primaryTarget: number | null;
+  duration: number;
+  totalDamage: number;
+};
+
+export type ConfluxRun = {
+  id: number;
+  startTime: number;
+  endTime: number | null;
+  duration: number | null;
+  roomCount: number;
+  completed: boolean | null;
+  buffs: ConfluxBuffDelta[];
+  rooms: ConfluxRoom[];
+};
+
+export type ConfluxSearchResult = {
+  runs: ConfluxRun[];
+  page: number;
+  pageCount: number;
+  runCount: number;
 };
 
 export type SBAEvent = [

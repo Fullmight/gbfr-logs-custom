@@ -1,5 +1,6 @@
-import { CharacterType, ComputedSkillState } from "@/types";
-import { getSkillName } from "@/utils";
+import { useMeterSettingsStore } from "@/stores/useMeterSettingsStore";
+import { AbilityBreakdownColumn, CharacterType, ComputedSkillState } from "@/types";
+import { computeOvercapPercentage, getSkillName } from "@/utils";
 import { ActionIcon, Tooltip } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { Info } from "@phosphor-icons/react";
@@ -17,6 +18,7 @@ export type SkillRowProps = {
 export const SkillRow = ({ characterType, skill, color, nested }: SkillRowProps) => {
   const { t } = useTranslation();
   const [detailsOpened, { open: openDetails, close: closeDetails }] = useDisclosure(false);
+  const abilityColumns = useMeterSettingsStore((state) => state.ability_breakdown_columns);
   const {
     showFullValues,
     totalDamage,
@@ -91,6 +93,14 @@ export const SkillRow = ({ characterType, skill, color, nested }: SkillRowProps)
           {skill.percentage.toFixed(0)}
           <span className="unit font-sm">%</span>
         </td>
+        {abilityColumns.map((column) => {
+          const value = column === AbilityBreakdownColumn.Overcap ? computeOvercapPercentage(skill) : null;
+          return (
+            <td key={column} className="text-center row-data">
+              {value === null ? "—" : `${value.toFixed(1)}%`}
+            </td>
+          );
+        })}
         <td className="text-center row-data">
           {skill.damageDetails && (
             <Tooltip label={t("ui.damage-details.open")}>

@@ -204,6 +204,12 @@ pub struct SkillState {
     /// Damage modifiers averaged across captured hits for this skill.
     #[serde(default)]
     pub damage_details: Option<AverageDamageDetails>,
+    /// Exact sums used by the game's per-ability overcap display. These are
+    /// totals, not averages, so mixed caps aggregate without weighting errors.
+    #[serde(default)]
+    pub overcap_base_sum: f64,
+    #[serde(default)]
+    pub overcap_cap_sum: f64,
 }
 
 impl SkillState {
@@ -218,6 +224,8 @@ impl SkillState {
             max_stun_value: 0.0,
             total_stun_value: 0.0,
             damage_details: None,
+            overcap_base_sum: 0.0,
+            overcap_cap_sum: 0.0,
         }
     }
 
@@ -226,6 +234,15 @@ impl SkillState {
         self.total_damage += damage_instance.event.damage as u64;
         self.max_stun_value = self.max_stun_value.max(damage_instance.stun_damage);
         self.total_stun_value += damage_instance.stun_damage;
+
+        if let Some(details) = &damage_instance.event.details {
+            let base = details.uncapped_damage as f64;
+            let cap = details.damage_cap as f64;
+            if base.is_finite() && base > 0.0 && cap.is_finite() && cap > 0.0 {
+                self.overcap_base_sum += base;
+                self.overcap_cap_sum += cap;
+            }
+        }
 
         // Supplementary damage is emitted as a separate event, but its ratio is
         // already represented by `e` on the originating hit. Do not create a
@@ -398,5 +415,40 @@ mod tests {
             .unwrap();
         assert_eq!(damage_limit.active_hits, 1);
         assert!((damage_limit.average_value - 0.15).abs() < 0.0001);
+
+        let event = |details: DamageDetails| DamageEvent {
+            source: Actor {
+                index: 1,
+                actor_type: 1,
+                parent_actor_type: 1,
+                parent_index: 1,
+            },
+            target: Actor {
+                index: 2,
+                actor_type: 2,
+                parent_actor_type: 2,
+                parent_index: 2,
+            },
+            action_id: ActionType::Normal(1),
+            damage: 100,
+            flags: 0,
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: Some(details.damage_cap),
+            details: Some(details),
+        };
+        let mut skill = SkillState::new(ActionType::Normal(1), CharacterType::Pl0000);
+        let first_event = event(first.clone());
+        let second_event = event(second.clone());
+        skill.update_from_damage_event(&AdjustedDamageInstance::from_damage_event(
+            &first_event,
+            None,
+        ));
+        skill.update_from_damage_event(&AdjustedDamageInstance::from_damage_event(
+            &second_event,
+            None,
+        ));
+        assert_eq!(skill.overcap_base_sum, 670_621.0);
+        assert_eq!(skill.overcap_cap_sum, 530_591.0);
     }
 }
